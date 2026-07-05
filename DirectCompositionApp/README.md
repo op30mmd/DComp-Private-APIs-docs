@@ -1,121 +1,93 @@
-# DirectComposition Private APIs Demo
+# DirectComposition Text Editor
 
-A demonstration application showcasing Windows DirectComposition private APIs based on reverse engineering analysis of `dcomp.dll`.
+A Notepad-style text editor built entirely on DirectComposition, D2D, and DWrite — no GDI, no Win32 controls. Renders all UI (menu bar, status bar, line numbers, text, caret, syntax highlighting) via DirectComposition swap chains. Uses reverse-engineered private `dcomp.dll` APIs for frame statistics and presentation control.
 
 ## Overview
 
-This application demonstrates the use of DirectComposition APIs documented in `DirectComposition_Private_APIs.md`, including:
+The editor demonstrates a complete rendering pipeline built on top of DirectComposition private APIs:
 
-- **DCompositionCreateDevice3** - Creates an IDCompositionDevice3 interface
-- **IDCompositionDesktopDevice** - Private interface for HWND-based targets (GUID: `5F4633FE-1E08-4CB8-8C75-CE24333F5602`)
-- **DCompositionGetFrameId** - Queries the current composition frame ID
-- **DCompositionGetStatistics** - Retrieves per-frame composition statistics
-- **DCompositionBoostCompositorClock** - Boosts compositor clock frequency
-- **DCompositionWaitForCompositorClock** - Waits for compositor clock tick
-- **CreatePresentationFactory** - Private undocumented presentation factory creation
+- **DCompositionCreateDevice3** with v1→v2→v3 device chain
+- **IDCompositionDesktopDevice** for HWND binding
+- Private frame statistics APIs (`DCompositionGetFrameId`, `DCompositionGetStatistics`)
+- **CreatePresentationFactory** undocumented API
+- **D2D1** + **DWrite** for all text rendering
+- **Direct Manipulation** for smooth scrolling
+- **Tree-sitter** for syntax highlighting
 
 ## Architecture
 
 ```
 DirectCompositionApp/
-├── main.cpp              # Window creation and message loop
-├── DCompHelper.h/cpp     # Core DirectComposition device management
-├── PrivateApiDemo.h/cpp  # Private API wrapper functions
-└── CMakeLists.txt        # Build configuration
+├── main.cpp                    # Window, message loop, rendering, input (~1700 lines)
+├── DCompHelper.h/cpp           # DComp device chain, D2D/DWrite init, swap chain, resize
+├── DirectManipHelper.h/cpp     # Direct Manipulation viewport, smooth scroll, VSync paint loop
+├── TreeSitterHighlighter.h/cpp # Tree-sitter-cpp integration, UTF-8→UTF-16 offset mapping
+├── PrivateApiDemo.h/cpp        # Frame statistics wrapper (DCompositionGetStatistics etc.)
+├── PresentationFactoryDemo.h/cpp # CreatePresentationFactory demo (unused)
+└── CMakeLists.txt              # Build configuration (CMake, MSVC 2022)
 ```
+
+## Features
+
+### Text Editing
+- Character input, cursor navigation (arrows, Home/End, Ctrl+arrows)
+- Selection (Shift+arrows, Ctrl+A, Shift+click, click-drag)
+- Clipboard (Ctrl+C/X/V)
+- Undo/Redo (Ctrl+Z/Ctrl+Y)
+- Tab insertion, Enter, Backspace, Delete
+- Open/Save files with UTF-8 support via Win32 file dialogs
+
+### UI Chrome (All D2D-rendered)
+- **Menu bar**: File, Edit, Format, View, Help — classic Notepad style with shortcuts
+- **Status bar**: Character count, line/column, FPS via DComp frame statistics
+- **Line numbers**: Dynamic gutter width based on digit count, 12pt font
+- **Hint bar**: Context-sensitive help text at the bottom
+- **Dropdown menus**: Hover tracking, keyboard shortcuts displayed, separators
+- **Right-click context menu**: Cut/Copy/Paste/Select All, grayed by state
+
+### Syntax Highlighting
+- Tree-sitter-cpp with incremental parsing
+- 10 capture types: keywords, types, functions, strings, numbers, comments, operators, preprocessor, parameters, field names
+- UTF-8→UTF-16 offset mapping for DWrite text layout
+
+### Smooth Scrolling
+- Direct Manipulation viewport with manual update mode
+- VSync-chained paint loop (InvalidateRect at end of WM_PAINT)
+- Mouse wheel with delta-based scrolling
+- Cursor following during text input
+
+### Cursor Management
+- Class cursor set to nullptr to avoid flickering
+- I-beam for text area, hand for menu bar/dropdowns, arrow for gutter/status/hint bar
+- Cursor cached to avoid redundant SetCursor calls
+- HTCLIENT check for proper non-client area handling (border resize cursors)
+- Drag-selection preserves I-beam outside window bounds
 
 ## Building
 
 ### Prerequisites
-- Windows 10/11 SDK
-- Visual Studio 2019+ or CMake 3.20+
-- C++17 compatible compiler
+- Windows 11 SDK (10.0.26100.0)
+- Visual Studio 2022 (MSVC 19.44)
+- CMake 3.20+
 
-### Build with CMake
+### Quick Build
 ```bash
-mkdir build
-cd build
-cmake .. -G "Visual Studio 16 2019" -A x64
-cmake --build . --config Release
+build.bat
 ```
 
-### Build with Visual Studio
-1. Open `CMakeLists.txt` in Visual Studio
-2. Select configuration (Debug/Release)
-3. Build the solution
-
-## Features
-
-### Visual Composition
-- Creates a visual tree with 5 colored rectangles
-- Uses `IDCompositionVisual` for each element
-- Applies `IDCompositionRectangleClip` for visual clipping
-
-### Frame Statistics
-- Real-time frame ID display
-- Composition rate monitoring
-- Frame timing statistics
-
-### Private API Usage
-- Demonstrates undocumented API functions
-- Shows proper error handling patterns
-- Uses NT kernel syscall wrappers
-
-## API Reference
-
-### DCompositionCreateDevice3
-```cpp
-HRESULT DCompositionCreateDevice3(
-    IDXGIDevice* dxgiDevice,
-    REFIID riid,
-    void** ppvDevice
-);
+### Manual Build
+```bash
+mkdir build && cd build
+cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Debug
 ```
 
-### IDCompositionDesktopDevice (Private Interface)
-```cpp
-// GUID: {5F4633FE-1E08-4CB8-8C75-CE24333F5602}
-// Extends IDCompositionDevice2
-STDMETHOD(CreateTargetForHwnd)(
-    HWND hwnd,
-    BOOL topmost,
-    IDCompositionTarget** target
-) PURE;
-```
-
-### DCompositionGetStatistics
-```cpp
-HRESULT DCompositionGetStatistics(
-    COMPOSITION_FRAME_ID frameId,
-    COMPOSITION_FRAME_STATS* frameStats,
-    UINT targetIdCount,
-    COMPOSITION_TARGET_ID* targetIds,
-    UINT* actualTargetIdCount
-);
-```
-
-### DCompositionBoostCompositorClock
-```cpp
-HRESULT DCompositionBoostCompositorClock(BOOL boost);
-```
-
-### CreatePresentationFactory (Undocumented)
-```cpp
-HRESULT CreatePresentationFactory(
-    IUnknown* punkDevice,
-    REFIID riid,  // {8FB37B58-1D74-4F64-A49C-1F97A80A2EC0}
-    void** ppvFactory
-);
-```
+### Output
+`build\bin\Release\DirectCompositionApp.exe`
 
 ## Notes
 
-- The application requires a compatible GPU with D3D11 support
+- Requires Intel/AMD GPU with D3D11 and D2D support
 - Private APIs may change between Windows versions
-- Use responsibly - these are undocumented interfaces
-
-## References
-
-- [DirectComposition_Private_APIs.md](../DirectComposition_Private_APIs.md) - Complete API documentation
-- [Microsoft DirectComposition Docs](https://learn.microsoft.com/en-us/windows/win32/directcomposition/directcomposition-portal)
-- [IDCompositionDevice3 Interface](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nn-dcomp-idcompositiondevice3)
+- Tree-sitter grammar libraries built as static libs via CMake
+- No GDI or Win32 common controls used — everything is custom-rendered
