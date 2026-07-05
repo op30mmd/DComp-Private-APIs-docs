@@ -297,6 +297,8 @@ Accepted GUIDs: 1
   - {75DEF60C-9D13-4B0D-A36E-EB6F4864E85F} (IDCompositionDevice2)
 ```
 
+**Correction (verified 2026-07-05):** The GUID `{75DEF60C-9D13-4B0D-A36E-EB6F4864E85F}` is **rejected at runtime** on Windows 11 24H2. `DCompositionCreateDevice2` returns `E_NOINTERFACE` for this GUID. The working approach is to call `DCompositionCreateDevice3` with the v1 GUID `{C37EA93A-E7AA-450D-B16F-9746CB0407F3}`, then `QueryInterface` up to `IDCompositionDevice2` and `IDCompositionDevice3`.
+
 ### DCompositionCreateDevice3
 ```
 jmp to 0x7fffb6fd4308
@@ -327,6 +329,15 @@ HRESULT DCompositionGetStatistics(
     _In_ UINT64 frameId,
     _Out_ DCOMPOSITION_FRAME_STATISTICS* stats,  // via stack param at [rsp+0x60]
     _In_ UINT32 statsSize
+);
+```
+
+**Correction (verified 2026-07-05):** The actual parameter order in the calling convention is `(frameId, statsSize, stats)` — the `statsSize` comes before the `stats` pointer. This matters for static analysis where the stack layout shows `[rsp+0x60]` as the third argument (stats pointer) but the second register parameter (`edx`) is `statsSize`. A working C declaration:
+```c
+HRESULT DCompositionGetStatistics(
+    _In_ UINT64 frameId,
+    _In_ UINT32 statsSize,
+    _Out_ DCOMPOSITION_FRAME_STATISTICS* stats
 );
 ```
 
@@ -365,6 +376,8 @@ HRESULT DCompositionGetTargetStatistics(
 ```c
 HRESULT DCompositionGetFrameId(_Out_ UINT64* frameId);
 ```
+
+**Correction (verified 2026-07-05):** The actual call pattern returns the frame ID in `eax`/`rax` directly, not via the out pointer. The caller should capture the return value as the frame ID. The `HRESULT` return is the low 32 bits; the frame ID occupies the full 64-bit register pair (`edx:eax`). If using a C wrapper, declare the return type as `UINT64` and ignore the HRESULT semantics — the frame ID is always valid (0 is a valid frame ID meaning "no frames yet").
 
 **Implementation:**
 ```
@@ -845,6 +858,143 @@ FUN_18000c31c: Format error string with:
   - Source file string (.rdata)
   - HRESULT value
 ```
+
+---
+
+---
+
+## 19. Practical Notes & Known Gotchas
+
+These issues were discovered while building a D2D/DWrite text editor on top of DirectComposition (July 2026). They are not documented anywhere in Microsoft's public or semi-public documentation.
+
+### 19.1 D3D11 BGRA Support is Mandatory for D2D Interop
+
+**Symptom:** `D2D1Factory1::CreateDevice(IDXGIDevice*)` returns `E_INVALIDARG`.
+
+**Cause:** `D3D11CreateDevice` was called without `D3D11_CREATE_DEVICE_BGRA_SUPPORT`. The `D2D1CreateDevice` call chains through the DXGI device, and D2D requires BGRA texture support on the underlying D3D11 device.
+
+**Fix:**
+```c
+UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+D3D11CreateDevice(
+    adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+    createFlags, nullptr, 0, D3D11_SDK_VERSION,
+    device.GetAddressOf(), nullptr, context.GetAddressOf());
+```
+
+**Impact:** Without this flag, the entire D2D rendering pipeline on DComp surfaces fails silently at device creation. This is the single most common initialization failure.
+
+### 19.2 IDCompositionSurface::BeginDraw Returns E_NOINTERFACE
+
+**Symptom:** `IDCompositionSurface::BeginDraw(IID_PPV_ARGS(&ctx))` returns `E_NOINTERFACE`.
+
+**Cause:** Surfaces created via `IDCompositionDevice2::CreateSurface()` are **not D2D-aware**. They are raw composition surfaces that only support `IDXGISwapChain`-based rendering, not D2D's `BeginDraw`/`EndDraw` pattern.
+
+**Fix:** Use `IDXGIFactory1::CreateSwapChainForComposition()` instead:
+```c
+DXGI_SWAP_CHAIN_DESC1 desc = {};
+desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+desc.BufferCount = 2;
+desc.SampleDesc.Count = 1;
+desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+
+ComPtr<IDXGISwapChain1> swapChain;
+factory->CreateSwapChainForComposition(device.Get(), &desc, nullptr, swapChain.GetAddressOf());
+
+// Set on visual
+visual->SetContent(swapChain.Get());
+
+// Render via D2D bitmap from swap chain back buffer
+ComPtr<IDXGISurface> backBuffer;
+swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()));
+// ... create D2D bitmap from backBuffer, draw, present
+```
+
+**Why this works:** The swap chain is a DXGI object that DComp can composite. The D2D render target is created from the swap chain's back buffer surface, which is a standard DXGI surface that D2D understands. This is the standard pattern for D2D rendering on DirectComposition.
+
+**Performance note:** Use `Present(1, 0)` (vsync) or `Present(0, 0)` (immediate) depending on latency needs. For a text editor, vsync is fine.
+
+### 19.3 IDXGIDevice::GetParent Returns IDXGIAdapter, Not IDXGIFactory
+
+**Symptom:** `IDXGIDevice::GetParent(IID_PPV_ARGS(&factory))` fails or returns an `IDXGIAdapter`.
+
+**Cause:** The DXGI device hierarchy is: `IDXGIDevice` → `IDXGIAdapter` → `IDXGIFactory`. Calling `GetParent` once returns the adapter, not the factory.
+
+**Fix:** Use `CreateDXGIFactory1()` directly instead of navigating the device hierarchy:
+```c
+ComPtr<IDXGIFactory1> factory;
+CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()));
+```
+
+**Note:** This is standard DXGI practice but easy to forget when the DComp device creation flow naturally starts from an `IDXGIDevice`.
+
+### 19.4 DCompositionCreateDevice3 GUID Selection
+
+**Verified behavior (Windows 11 24H2):**
+
+| GUID | Accepted? | Notes |
+|------|-----------|-------|
+| `{C37EA93A-E7AA-450D-B16F-9746CB0407F3}` | ✅ Yes | v1 IID — use this, then QI up |
+| `{75DEF60C-9D13-4B0D-A36E-EB6F4864E85F}` | ❌ No | v2 IID — rejected by DCompositionCreateDevice2 |
+| `{85FC5CCA-2DA6-494C-86B64A775C049B8A}` | ❌ No | v3 IID — rejected |
+| `{0987CB06-F406-460B-A2E6-A26C55E6A252}` | ❌ No | v3 IID — rejected |
+
+**Correct pattern:**
+```c
+// Create with v1 IID
+DCompositionCreateDevice3(
+    &IID_IDCompositionDevice,    // {C37EA93A-...}
+    IID_PPV_ARGS(device1.GetAddressOf()));
+
+// QI up the chain
+device1->QueryInterface(IID_PPV_ARGS(device2.GetAddressOf()));  // IDCompositionDevice2
+device1->QueryInterface(IID_PPV_ARGS(device3.GetAddressOf()));  // IDCompositionDevice3
+```
+
+### 19.5 D3D11CreateDevice — Required Flags for DComp Pipeline
+
+For a complete D2D-on-DComp rendering pipeline, the D3D11 device must be created with:
+
+```c
+UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;  // Required for D2D interop
+#ifdef _DEBUG
+flags |= D3D11_CREATE_DEVICE_DEBUG;              // Optional: debug layer
+#endif
+
+D3D11CreateDevice(
+    adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+    flags, nullptr, 0, D3D11_SDK_VERSION,
+    device.GetAddressOf(), nullptr, context.GetAddressOf());
+```
+
+**Minimal required flags:**
+- `D3D11_CREATE_DEVICE_BGRA_SUPPORT` — enables BGRA texture format support required by D2D
+- No other flags are strictly required for basic rendering
+
+### 19.6 Complete Device Chain Summary
+
+The working initialization chain for D2D rendering on DirectComposition:
+
+```
+1. D3D11CreateDevice(BGRA_SUPPORT)         → ID3D11Device
+2. ID3D11Device::QueryInterface(IDXGIDevice) → IDXGIDevice
+3. DCompositionCreateDevice3(v1 GUID)       → IDCompositionDevice
+4. IDCompositionDevice::QueryInterface       → IDCompositionDevice2
+5. IDCompositionDevice2::CreateVisual        → IDCompositionVisual2
+6. IDCompositionDevice3::CreateVisual        → IDCompositionVisual3
+7. IDCompositionDesktopDevice::CreateTargetForHwnd → IDCompositionTarget
+8. CreateDXGIFactory1()                     → IDXGIFactory1
+9. D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED) → ID2D1Factory1
+10. D2D1CreateDevice(IDXGIDevice)            → ID2DDevice
+11. ID2DDevice::CreateDeviceContext          → ID2DDeviceContext1
+12. IDXGIFactory1::CreateSwapChainForComposition → IDXGISwapChain1
+13. IDCompositionVisual2::SetContent(swapChain)
+14. IDCompositionTarget::SetRoot(rootVisual)
+15. IDCompositionSurface::Commit()
+```
+
+**Key constraint:** Steps 8-12 (D2D rendering) must use the same DXGI device that was created in steps 1-2. Cross-device interop is not supported.
 
 ---
 
