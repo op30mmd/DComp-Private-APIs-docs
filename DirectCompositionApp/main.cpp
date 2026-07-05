@@ -59,6 +59,22 @@ static ComPtr<IDWriteTextFormat> g_statusFmt;
 static ComPtr<IDWriteTextFormat> g_tabFmt;
 static ComPtr<IDWriteTextFormat> g_hintFmt;
 
+// Pre-cached cursor coordinates to prevent massive text parsing lag
+static size_t g_cachedLineNo = 1;
+static size_t g_cachedColNo = 0;
+
+// Globally pre-cached brushes for highlight types to prevent heavy allocations
+static ComPtr<ID2D1SolidColorBrush> g_brushKeyword;
+static ComPtr<ID2D1SolidColorBrush> g_brushFunction;
+static ComPtr<ID2D1SolidColorBrush> g_brushType;
+static ComPtr<ID2D1SolidColorBrush> g_brushString;
+static ComPtr<ID2D1SolidColorBrush> g_brushComment;
+static ComPtr<ID2D1SolidColorBrush> g_brushNumber;
+static ComPtr<ID2D1SolidColorBrush> g_brushOperator;
+static ComPtr<ID2D1SolidColorBrush> g_brushConstant;
+static ComPtr<ID2D1SolidColorBrush> g_brushProperty;
+static ComPtr<ID2D1SolidColorBrush> g_brushVariable;
+
 struct EditAction { size_t pos; std::wstring removed; std::wstring inserted; };
 
 struct TabInfo {
@@ -90,6 +106,33 @@ static void Invalidate();
 static std::vector<EditAction> g_undoStack;
 static std::vector<EditAction> g_redoStack;
 
+static void InitHighlightBrushes() {
+    auto ctx = g_dcomp->GetD2DContext();
+    if (!ctx) return;
+
+    g_brushKeyword.Reset();
+    g_brushFunction.Reset();
+    g_brushType.Reset();
+    g_brushString.Reset();
+    g_brushComment.Reset();
+    g_brushNumber.Reset();
+    g_brushOperator.Reset();
+    g_brushConstant.Reset();
+    g_brushProperty.Reset();
+    g_brushVariable.Reset();
+
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.56f, 0.78f, 0.96f), g_brushKeyword.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.78f, 0.82f, 0.56f), g_brushFunction.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.86f, 0.60f, 0.45f), g_brushType.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.65f, 0.82f, 0.56f), g_brushString.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.45f, 0.52f, 0.40f), g_brushComment.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.68f, 0.90f), g_brushNumber.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.75f, 0.75f, 0.78f), g_brushOperator.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.86f, 0.72f, 0.50f), g_brushConstant.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.70f, 0.80f, 0.88f), g_brushProperty.GetAddressOf());
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.88f, 0.88f, 0.88f), g_brushVariable.GetAddressOf());
+}
+
 static void SaveTabState() {
     auto& t = ActiveTab();
     t.text = g_text;
@@ -117,6 +160,11 @@ static void LoadTabState() {
     t.undoStack.clear();
     t.redoStack.clear();
     g_layoutDirty = true;
+    if (g_dmanip) {
+        float totalH = GetTotalDocumentHeight();
+        g_dmanip->SetContentHeight(totalH);
+        g_dmanip->ScrollTo(g_scrollY, FALSE);
+    }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -135,6 +183,10 @@ static void NewTab() {
     g_undoStack.clear();
     g_redoStack.clear();
     g_layoutDirty = true;
+    if (g_dmanip) {
+        g_dmanip->SetContentHeight(1.0f);
+        g_dmanip->ScrollTo(0.0f, FALSE);
+    }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -152,11 +204,6 @@ static void SwitchTab(int idx) {
     SaveTabState();
     g_activeTab = idx;
     LoadTabState();
-    if (g_dmanip) {
-        float totalH = GetTotalDocumentHeight();
-        g_dmanip->SetContentHeight(totalH);
-        g_dmanip->ScrollTo(g_scrollY, FALSE);
-    }
 }
 
 static void InitTabBar() {
@@ -361,11 +408,11 @@ static void CloseMenu() {
 
 struct CtxMenuItem { const wchar_t* label; int action; bool separator; };
 static CtxMenuItem g_ctxItems[] = {
-    { L"Cut",         MA_CUT },
-    { L"Copy",        MA_COPY },
-    { L"Paste",       MA_PASTE },
-    { L"", MA_NONE, true },
-    { L"Select All",  MA_SELECTALL },
+    { L"Cut",           MA_CUT },
+    { L"Copy",          MA_COPY },
+    { L"Paste",         MA_PASTE },
+    { L"",              MA_NONE, true },
+    { L"Select All",    MA_SELECTALL },
 };
 static const int g_ctxItemCount = 5;
 
@@ -620,6 +667,18 @@ static void ExecMenuAction(int action) {
     Invalidate();
 }
 
+static bool InDropdownBounds(float mx, float my) {
+    if (g_menuOpen < 0) return false;
+    MenuDef& m = g_menus[g_menuOpen];
+    float dw = 240.0f;
+    float dx = m.x;
+    float dy = g_menuBarH;
+    float totalH = 0;
+    for (int i = 0; i < m.count; i++)
+        totalH += m.items[i].separator ? 6.0f : 24.0f;
+    return (mx >= dx && mx <= dx + dw && my >= dy && my <= dy + totalH);
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
@@ -713,6 +772,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_hintFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
 
+        InitHighlightBrushes();
         InitMenuBar();
         InitTabBar();
         SetTimer(hwnd, 1, 500, nullptr);
@@ -842,15 +902,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         if (g_menuOpen >= 0) {
-            int item = HitTestDropdown(mx, my);
-            if (item >= 0) {
-                MenuDef& m = g_menus[g_menuOpen];
-                ExecMenuAction(m.items[item].action);
+            int menu = HitTestMenuBar(mx, my);
+            if (menu >= 0) {
+                if (menu == g_menuOpen) {
+                    CloseMenu();
+                } else {
+                    g_menuOpen = menu;
+                    g_dropHover = -1;
+                    g_menuTracking = true;
+                }
+            } else {
+                int item = HitTestDropdown(mx, my);
+                if (item >= 0) {
+                    MenuDef& m = g_menus[g_menuOpen];
+                    ExecMenuAction(m.items[item].action);
+                    CloseMenu();
+                }
             }
-            CloseMenu();
             Invalidate();
             return 0;
         }
+
+        SetFocus(hwnd);
 
         int menu = HitTestMenuBar(mx, my);
         if (menu >= 0) {
@@ -864,6 +937,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         int tabIdx = HitTestTabBar(mx, my);
         if (tabIdx >= 0) {
+            CloseMenu();
             if (HitTestTabClose(mx, my, tabIdx)) {
                 CloseTab(tabIdx);
             } else {
@@ -978,19 +1052,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         if (g_menuTracking) {
-            int item = HitTestDropdown(mx, my);
-            if (item != g_dropHover) {
-                g_dropHover = item;
-            }
             int menu = HitTestMenuBar(mx, my);
-            if (menu >= 0 && menu != g_menuOpen) {
-                g_menuOpen = menu;
-                g_dropHover = -1;
-            }
-            if (item < 0 && menu < 0) {
-                int tabIdx = HitTestTabBar(mx, my);
-                if (tabIdx < 0) {
-                    CloseMenu();
+            if (menu >= 0) {
+                if (menu != g_menuOpen) {
+                    g_menuOpen = menu;
+                    g_dropHover = -1;
+                }
+            } else {
+                bool onMenuBar = (my >= 0 && my < g_menuBarH);
+                if (onMenuBar) {
+                    g_dropHover = -1;
+                } else if (InDropdownBounds(mx, my)) {
+                    int item = HitTestDropdown(mx, my);
+                    if (item != g_dropHover) {
+                        g_dropHover = item;
+                    }
                 }
             }
             Invalidate();
@@ -1051,10 +1127,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_KILLFOCUS:
-        if (g_menuOpen >= 0) {
-            CloseMenu();
-            Invalidate();
-        }
         return 0;
 
     case WM_SETCURSOR: {
@@ -1213,7 +1285,23 @@ static size_t LastNewlineBefore(size_t pos) {
     return 0;
 }
 
+static void UpdateCursorCache() {
+    g_cachedLineNo = CountNewlinesBefore(g_cursorPos) + 1;
+    g_cachedColNo = g_cursorPos - LastNewlineBefore(g_cursorPos);
+}
+
 static void HandleKey(WPARAM wParam) {
+    if (wParam == VK_ESCAPE) {
+        if (g_menuOpen >= 0) {
+            CloseMenu();
+            Invalidate();
+        } else if (g_ctxOpen) {
+            CloseCtxMenu();
+            Invalidate();
+        }
+        return;
+    }
+
     bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
@@ -1508,9 +1596,74 @@ static void UpdateLayout() {
         g_textLayout->SetWordWrapping(g_wordWrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
     }
 
+    if (!g_brushKeyword) {
+        InitHighlightBrushes();
+    }
+
     if (IsCppFile(g_filePath)) {
         std::string utf8 = WToUtf8(g_text);
         g_highlighter.UpdateSource(utf8.c_str(), (uint32_t)utf8.size());
+
+        if (g_textLayout && g_highlighter.GetHighlights().size() > 0) {
+            std::vector<uint32_t> utf8ToUtf16;
+            utf8ToUtf16.reserve(utf8.size() + 1);
+            uint32_t utf16Idx = 0;
+            for (size_t i = 0; i < g_text.length(); i++) {
+                wchar_t wc = g_text[i];
+                int bytes = 0;
+                if (wc < 0x80) {
+                    bytes = 1;
+                } else if (wc < 0x800) {
+                    bytes = 2;
+                } else if (wc >= 0xD800 && wc <= 0xDBFF) {
+                    bytes = 4;
+                    i++;
+                } else {
+                    bytes = 3;
+                }
+                for (int b = 0; b < bytes; b++) {
+                    utf8ToUtf16.push_back(utf16Idx);
+                }
+                utf16Idx += (bytes == 4) ? 2 : 1;
+            }
+            utf8ToUtf16.push_back(utf16Idx);
+
+            for (auto& hl : g_highlighter.GetHighlights()) {
+                if (hl.startByte >= utf8ToUtf16.size() || hl.endByte > utf8ToUtf16.size()) continue;
+                uint32_t startChar = utf8ToUtf16[hl.startByte];
+                uint32_t endChar = utf8ToUtf16[hl.endByte];
+                if (startChar >= endChar) continue;
+
+                ID2D1SolidColorBrush* brush = nullptr;
+                const char* name = hl.captureName;
+                if (strstr(name, "keyword")) {
+                    brush = g_brushKeyword.Get();
+                } else if (strstr(name, "function")) {
+                    brush = g_brushFunction.Get();
+                } else if (strstr(name, "type")) {
+                    brush = g_brushType.Get();
+                } else if (strstr(name, "string")) {
+                    brush = g_brushString.Get();
+                } else if (strstr(name, "comment")) {
+                    brush = g_brushComment.Get();
+                } else if (strstr(name, "number")) {
+                    brush = g_brushNumber.Get();
+                } else if (strstr(name, "operator")) {
+                    brush = g_brushOperator.Get();
+                } else if (strstr(name, "constant")) {
+                    brush = g_brushConstant.Get();
+                } else if (strstr(name, "property")) {
+                    brush = g_brushProperty.Get();
+                } else if (strstr(name, "variable")) {
+                    brush = g_brushVariable.Get();
+                }
+
+                if (brush) {
+                    DWRITE_TEXT_RANGE range = { startChar, endChar - startChar };
+                    g_textLayout->SetDrawingEffect(brush, range);
+                }
+            }
+        }
     } else {
         g_highlighter.UpdateSource("", 0);
     }
@@ -1540,6 +1693,7 @@ static float GetTotalDocumentHeight() {
 }
 
 static void EnsureCursorVisible() {
+    UpdateCursorCache();
     UpdateLayout();
     if (!g_textLayout) return;
 
@@ -1596,72 +1750,6 @@ static void RenderEditor() {
     ctx->Clear(D2D1::ColorF(0.10f, 0.10f, 0.12f));
 
     UpdateLayout();
-
-    if (g_textLayout && IsCppFile(g_filePath) && g_highlighter.GetHighlights().size() > 0) {
-        auto ctx2 = g_dcomp->GetD2DContext();
-        const std::string& utf8 = WToUtf8(g_text);
-
-        std::vector<uint32_t> utf8ToUtf16;
-        utf8ToUtf16.reserve(utf8.size() + 1);
-        uint32_t utf16Idx = 0;
-        for (size_t i = 0; i < g_text.length(); i++) {
-            wchar_t wc = g_text[i];
-            int bytes = 0;
-            if (wc < 0x80) {
-                bytes = 1;
-            } else if (wc < 0x800) {
-                bytes = 2;
-            } else if (wc >= 0xD800 && wc <= 0xDBFF) {
-                bytes = 4;
-                i++;
-            } else {
-                bytes = 3;
-            }
-            for (int b = 0; b < bytes; b++) {
-                utf8ToUtf16.push_back(utf16Idx);
-            }
-            utf16Idx += (bytes == 4) ? 2 : 1;
-        }
-        utf8ToUtf16.push_back(utf16Idx);
-
-        for (auto& hl : g_highlighter.GetHighlights()) {
-            if (hl.startByte >= utf8ToUtf16.size() || hl.endByte > utf8ToUtf16.size()) continue;
-            uint32_t startChar = utf8ToUtf16[hl.startByte];
-            uint32_t endChar = utf8ToUtf16[hl.endByte];
-            if (startChar >= endChar) continue;
-
-            D2D1_COLOR_F color;
-            const char* name = hl.captureName;
-            if (strstr(name, "keyword")) {
-                color = D2D1::ColorF(0.56f, 0.78f, 0.96f);
-            } else if (strstr(name, "function")) {
-                color = D2D1::ColorF(0.78f, 0.82f, 0.56f);
-            } else if (strstr(name, "type")) {
-                color = D2D1::ColorF(0.86f, 0.60f, 0.45f);
-            } else if (strstr(name, "string")) {
-                color = D2D1::ColorF(0.65f, 0.82f, 0.56f);
-            } else if (strstr(name, "comment")) {
-                color = D2D1::ColorF(0.45f, 0.52f, 0.40f);
-            } else if (strstr(name, "number")) {
-                color = D2D1::ColorF(0.82f, 0.68f, 0.90f);
-            } else if (strstr(name, "operator")) {
-                color = D2D1::ColorF(0.75f, 0.75f, 0.78f);
-            } else if (strstr(name, "constant")) {
-                color = D2D1::ColorF(0.86f, 0.72f, 0.50f);
-            } else if (strstr(name, "property")) {
-                color = D2D1::ColorF(0.70f, 0.80f, 0.88f);
-            } else if (strstr(name, "variable")) {
-                color = D2D1::ColorF(0.88f, 0.88f, 0.88f);
-            } else {
-                continue;
-            }
-
-            ComPtr<ID2D1SolidColorBrush> brush;
-            ctx2->CreateSolidColorBrush(color, brush.GetAddressOf());
-            DWRITE_TEXT_RANGE range = { startChar, endChar - startChar };
-            g_textLayout->SetDrawingEffect(brush.Get(), range);
-        }
-    }
 
     if (g_textLayout) {
         D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, (float)g_windowW, (float)g_windowH - 30.0f);
@@ -1723,17 +1811,29 @@ static void RenderEditor() {
 
             size_t pos = 0;
             float lineY = 0.0f;
-            for (UINT32 i = 0; i < lineCount; i++) {
+            
+            // Fast-forward to the first visible line above viewport
+            UINT32 i = 0;
+            while (i < lineCount && lineY + metrics[i].height < g_scrollY) {
+                lineY += metrics[i].height;
+                pos += metrics[i].length;
+                i++;
+            }
+
+            for (; i < lineCount; i++) {
                 float ly = g_marginTop + lineY - g_scrollY;
                 float lh = metrics[i].height;
 
-                if (ly + lh >= 0 && ly <= (float)g_windowH) {
-                    wchar_t num[8];
-                    _snwprintf_s(num, 8, L"%u", i + 1);
-                    ctx->DrawText(num, (UINT32)wcslen(num), g_lineNoFmt.Get(),
-                        D2D1::RectF(4, ly, g_marginLeft - 8, ly + lh), lineNoBrush.Get(),
-                        D2D1_DRAW_TEXT_OPTIONS_NO_SNAP);
+                // Stop drawing immediately if the line goes below the viewport
+                if (ly > (float)g_windowH) {
+                    break;
                 }
+
+                wchar_t num[16];
+                _snwprintf_s(num, 16, L"%u", i + 1);
+                ctx->DrawText(num, (UINT32)wcslen(num), g_lineNoFmt.Get(),
+                    D2D1::RectF(4, ly, g_marginLeft - 8, ly + lh), lineNoBrush.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_NO_SNAP);
 
                 lineY += lh;
                 pos += metrics[i].length;
@@ -1852,8 +1952,8 @@ static void RenderEditor() {
         _snwprintf_s(statusBuf, 256,
             L"%zu chars  |  Ln %zu  Col %zu  |  %.0f fps",
             g_text.length(),
-            CountNewlinesBefore(g_cursorPos) + 1,
-            g_cursorPos - LastNewlineBefore(g_cursorPos),
+            g_cachedLineNo,
+            g_cachedColNo,
             fps);
         ComPtr<ID2D1SolidColorBrush> footerStatusBrush;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), footerStatusBrush.GetAddressOf());
@@ -1873,7 +1973,7 @@ static void RenderEditor() {
 
     if (g_menuOpen >= 0) {
         ComPtr<ID2D1SolidColorBrush> dropBg;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), dropBg.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), dropBg.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropHighlight;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), dropHighlight.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropText;
