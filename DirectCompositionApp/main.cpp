@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <commdlg.h>
+#include <dwmapi.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <wrl.h>
@@ -48,12 +49,99 @@ static bool g_dragging = false;
 static int g_windowW = 800;
 static int g_windowH = 600;
 static float g_marginLeft = 48.0f;
-static float g_marginTop = 62.0f;
+static float g_marginTop = 56.0f;
 static const float g_fontSize = 16.0f;
 static const float g_menuBarH = 24.0f;
 
 static ComPtr<IDWriteTextFormat> g_textFormat;
 static ComPtr<IDWriteTextLayout> g_textLayout;
+
+struct TabInfo {
+    std::wstring text;
+    size_t cursorPos = 0;
+    size_t selStart = 0;
+    size_t selEnd = 0;
+    float scrollY = 0;
+    std::wstring filePath;
+    bool dirty = false;
+    std::vector<std::pair<size_t, size_t>> undoStack;
+    std::vector<std::pair<size_t, size_t>> redoStack;
+    std::wstring displayName;
+};
+
+static std::vector<TabInfo> g_tabs;
+static int g_activeTab = 0;
+static const float g_tabBarH = 32.0f;
+static int g_tabHover = -1;
+static int g_tabCloseHover = -1;
+static bool g_tabDragging = false;
+static int g_tabDragIdx = -1;
+
+static TabInfo& ActiveTab() { return g_tabs[g_activeTab]; }
+
+static void SaveTabState() {
+    auto& t = ActiveTab();
+    t.text = g_text;
+    t.cursorPos = g_cursorPos;
+    t.selStart = g_selStart;
+    t.selEnd = g_selEnd;
+    t.scrollY = g_scrollY;
+}
+
+static void LoadTabState() {
+    auto& t = ActiveTab();
+    g_text = t.text;
+    g_cursorPos = t.cursorPos;
+    g_selStart = t.selStart;
+    g_selEnd = t.selEnd;
+    g_scrollY = t.scrollY;
+    g_layoutDirty = true;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void NewTab() {
+    SaveTabState();
+    TabInfo newTab;
+    newTab.displayName = L"Untitled";
+    g_tabs.push_back(std::move(newTab));
+    g_activeTab = (int)g_tabs.size() - 1;
+    g_text.clear();
+    g_cursorPos = 0;
+    g_selStart = 0;
+    g_selEnd = 0;
+    g_scrollY = 0;
+    g_layoutDirty = true;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CloseTab(int idx) {
+    if (g_tabs.size() <= 1) return;
+    SaveTabState();
+    g_tabs.erase(g_tabs.begin() + idx);
+    if (g_activeTab >= (int)g_tabs.size())
+        g_activeTab = (int)g_tabs.size() - 1;
+    LoadTabState();
+}
+
+static void SwitchTab(int idx) {
+    if (idx == g_activeTab || idx < 0 || idx >= (int)g_tabs.size()) return;
+    SaveTabState();
+    g_activeTab = idx;
+    LoadTabState();
+}
+
+static void InitTabBar() {
+    g_tabs.clear();
+    TabInfo first;
+    first.displayName = L"Untitled";
+    if (!g_filePath.empty()) {
+        first.filePath = g_filePath;
+        auto pos = g_filePath.find_last_of(L"\\/");
+        first.displayName = (pos != std::wstring::npos) ? g_filePath.substr(pos + 1) : g_filePath;
+    }
+    g_tabs.push_back(std::move(first));
+    g_activeTab = 0;
+}
 
 enum MenuAction {
     MA_NEW, MA_OPEN, MA_SAVE, MA_SAVEAS, MA_EXIT,
@@ -175,10 +263,10 @@ static void InitMenuBar() {
     }
 }
 
-static const float g_statusBarH = 36.0f;
+static const float g_statusBarH = 0.0f;
 
 static int HitTestMenuBar(float mx, float my) {
-    if (my >= g_statusBarH && my < g_statusBarH + g_menuBarH) {
+    if (my >= 0 && my < g_menuBarH) {
         for (int i = 0; i < g_menuCount; i++) {
             if (mx >= g_menus[i].x && mx < g_menus[i].x + g_menus[i].w)
                 return i;
@@ -187,12 +275,42 @@ static int HitTestMenuBar(float mx, float my) {
     return -1;
 }
 
+static const float g_tabCloseSize = 14.0f;
+static const float g_tabPadX = 12.0f;
+
+static float GetTabBarWidth() { return (float)g_windowW; }
+
+static int HitTestTabBar(float mx, float my) {
+    if (my < g_menuBarH || my >= g_menuBarH + g_tabBarH) return -1;
+    float x = 0;
+    for (int i = 0; i < (int)g_tabs.size(); i++) {
+        const auto& t = g_tabs[i];
+        float w = (float)(t.displayName.length()) * 8.0f + g_tabPadX * 2 + (g_tabs.size() > 1 ? 20.0f : 0);
+        if (mx >= x && mx < x + w) return i;
+        x += w;
+    }
+    return -1;
+}
+
+static bool HitTestTabClose(float mx, float my, int tabIdx) {
+    if (tabIdx < 0 || tabIdx >= (int)g_tabs.size()) return false;
+    float x = 0;
+    for (int i = 0; i < tabIdx; i++) {
+        x += (float)(g_tabs[i].displayName.length()) * 8.0f + g_tabPadX * 2 + 20.0f;
+    }
+    float w = (float)(g_tabs[tabIdx].displayName.length()) * 8.0f + g_tabPadX * 2 + 20.0f;
+    float closeX = x + w - 18.0f;
+    float closeY = g_menuBarH + (g_tabBarH - g_tabCloseSize) / 2.0f;
+    return (mx >= closeX && mx < closeX + g_tabCloseSize &&
+            my >= closeY && my < closeY + g_tabCloseSize);
+}
+
 static int HitTestDropdown(float mx, float my) {
     if (g_menuOpen < 0) return -1;
     MenuDef& m = g_menus[g_menuOpen];
     float dw = 240.0f;
     float dx = m.x;
-    float dy = g_statusBarH + g_menuBarH;
+    float dy = g_menuBarH;
     if (mx < dx || mx > dx + dw || my < dy) return -1;
     float iy = dy;
     for (int i = 0; i < m.count; i++) {
@@ -255,6 +373,9 @@ static void DoNew() {
     g_cursorPos = g_selStart = g_selEnd = 0;
     g_scrollY = 0;
     g_filePath.clear();
+    ActiveTab().displayName = L"Untitled";
+    ActiveTab().filePath.clear();
+    ActiveTab().dirty = false;
 }
 
 static void DoUndo() {
@@ -319,6 +440,10 @@ static void DoOpen() {
         g_scrollY = 0;
         g_undoStack.clear();
         g_redoStack.clear();
+        auto pos = g_filePath.find_last_of(L"\\/");
+        ActiveTab().displayName = (pos != std::wstring::npos) ? g_filePath.substr(pos + 1) : g_filePath;
+        ActiveTab().filePath = g_filePath;
+        ActiveTab().dirty = false;
     }
 }
 
@@ -343,6 +468,10 @@ static void DoSave() {
             WriteFile(hFile, buf.data(), len, &written, nullptr);
             CloseHandle(hFile);
             g_filePath = file;
+            auto pos = g_filePath.find_last_of(L"\\/");
+            ActiveTab().displayName = (pos != std::wstring::npos) ? g_filePath.substr(pos + 1) : g_filePath;
+            ActiveTab().filePath = g_filePath;
+            ActiveTab().dirty = false;
         }
     }
 }
@@ -526,6 +655,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         InitMenuBar();
+        InitTabBar();
         SetTimer(hwnd, 1, 500, nullptr);
         return 0;
     }
@@ -534,7 +664,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
         EndPaint(hwnd, &ps);
-        g_marginTop = 62.0f;
+        g_marginTop = 56.0f;
         if (g_dmanip) {
             g_dmanip->Update();
             g_scrollY = g_dmanip->GetScrollY();
@@ -628,6 +758,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_selStart = g_selEnd = g_cursorPos;
             g_caretVisible = true;
             g_layoutDirty = true;
+            ActiveTab().dirty = true;
             EnsureCursorVisible();
             Invalidate();
         }
@@ -668,6 +799,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_menuOpen = menu;
             g_dropHover = -1;
             g_menuTracking = true;
+            Invalidate();
+            return 0;
+        }
+
+        int tabIdx = HitTestTabBar(mx, my);
+        if (tabIdx >= 0) {
+            if (HitTestTabClose(mx, my, tabIdx)) {
+                CloseTab(tabIdx);
+            } else {
+                SwitchTab(tabIdx);
+            }
             Invalidate();
             return 0;
         }
@@ -778,6 +920,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         if (g_menuTracking) {
             int menu = HitTestMenuBar(mx, my);
+            int tabIdx = HitTestTabBar(mx, my);
+            if (tabIdx >= 0) {
+                CloseMenu();
+                Invalidate();
+                return 0;
+            }
             if (menu >= 0 && menu != g_menuOpen) {
                 g_menuOpen = menu;
                 g_dropHover = -1;
@@ -807,12 +955,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        bool inMenuBar = (my >= g_statusBarH && my < g_statusBarH + g_menuBarH);
-        bool inStatusBar = (my < g_statusBarH);
-        bool inHintBar = (my >= g_windowH - 20);
+        bool inMenuBar = (my >= 0 && my < g_menuBarH);
         int menu = HitTestMenuBar(mx, my);
         if (menu != g_menuHover) {
             g_menuHover = menu;
+            Invalidate();
+        }
+
+        int tabIdx = HitTestTabBar(mx, my);
+        if (tabIdx != g_tabHover) {
+            g_tabHover = tabIdx;
+            Invalidate();
+        }
+        bool closeHov = HitTestTabClose(mx, my, tabIdx);
+        int newCloseHov = closeHov ? tabIdx : -1;
+        if (newCloseHov != g_tabCloseHover) {
+            g_tabCloseHover = newCloseHov;
             Invalidate();
         }
         return 0;
@@ -820,7 +978,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        float visibleH = (float)g_windowH - g_marginTop - 24.0f;
+        float visibleH = (float)g_windowH - g_marginTop - 30.0f;
         float totalH = GetTotalDocumentHeight();
         float currentScroll = g_dmanip ? g_dmanip->GetScrollY() : g_scrollY;
         float newScroll = currentScroll - (float)delta * 0.5f;
@@ -864,14 +1022,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 overDropdown = (item >= 0);
             }
 
-            bool inMenuBar = (pt.y >= g_statusBarH && pt.y < g_statusBarH + g_menuBarH);
-            bool inStatusBar = (pt.y < g_statusBarH);
-            bool inHintBar = (pt.y >= g_windowH - 20);
+            bool inMenuBar = (pt.y >= 0 && pt.y < g_menuBarH);
+            bool inTabBar = (pt.y >= g_menuBarH && pt.y < g_menuBarH + g_tabBarH);
+            bool inHintBar = (pt.y >= g_windowH - 30);
             bool inGutter = (pt.x < g_marginLeft);
 
             if (inMenuBar || overDropdown) {
                 cursorId = IDC_HAND;
-            } else if (inStatusBar || inHintBar || inGutter) {
+            } else if (inTabBar) {
+                int tabIdx = HitTestTabBar((float)pt.x, (float)pt.y);
+                if (tabIdx >= 0 && HitTestTabClose((float)pt.x, (float)pt.y, tabIdx))
+                    cursorId = IDC_HAND;
+                else if (tabIdx >= 0)
+                    cursorId = IDC_HAND;
+                else
+                    cursorId = IDC_ARROW;
+            } else if (inHintBar || inGutter) {
                 cursorId = IDC_ARROW;
             } else {
                 cursorId = IDC_IBEAM;
@@ -908,7 +1074,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_layoutDirty = true;
             g_dcomp->ResizeSwapChain(w, h);
             if (g_dmanip) {
-                float visibleH = (float)h - 62.0f - 24.0f;
+                float visibleH = (float)h - g_menuBarH - 30.0f;
                 if (visibleH < 1) visibleH = 1;
                 g_dmanip->SetViewportSize((float)w, visibleH);
             }
@@ -1017,6 +1183,7 @@ static void HandleKey(WPARAM wParam) {
                     g_text.erase(a, b - a);
                     g_cursorPos = a;
                     g_selStart = g_selEnd = g_cursorPos;
+                    ActiveTab().dirty = true;
                 }
             }
             EnsureCursorVisible();
@@ -1038,6 +1205,7 @@ static void HandleKey(WPARAM wParam) {
                     g_text.insert(g_cursorPos, p);
                     g_cursorPos += wcslen(p);
                     g_selStart = g_selEnd = g_cursorPos;
+                    ActiveTab().dirty = true;
                     GlobalUnlock(hData);
                 }
             }
@@ -1074,6 +1242,26 @@ static void HandleKey(WPARAM wParam) {
         case 'Y':
             DoRedo();
             EnsureCursorVisible();
+            Invalidate();
+            return;
+        case 'T':
+            NewTab();
+            EnsureCursorVisible();
+            Invalidate();
+            return;
+        case 'W':
+            CloseTab(g_activeTab);
+            EnsureCursorVisible();
+            Invalidate();
+            return;
+        case VK_TAB:
+            if (shift) {
+                if (g_activeTab > 0) SwitchTab(g_activeTab - 1);
+                else SwitchTab((int)g_tabs.size() - 1);
+            } else {
+                if (g_activeTab < (int)g_tabs.size() - 1) SwitchTab(g_activeTab + 1);
+                else SwitchTab(0);
+            }
             Invalidate();
             return;
         case VK_HOME:
@@ -1177,6 +1365,7 @@ static void HandleKey(WPARAM wParam) {
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
         g_layoutDirty = true;
+        ActiveTab().dirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -1192,6 +1381,7 @@ static void HandleKey(WPARAM wParam) {
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
         g_layoutDirty = true;
+        ActiveTab().dirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -1207,6 +1397,7 @@ static void HandleKey(WPARAM wParam) {
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
         g_layoutDirty = true;
+        ActiveTab().dirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -1222,6 +1413,7 @@ static void HandleKey(WPARAM wParam) {
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
         g_layoutDirty = true;
+        ActiveTab().dirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -1242,7 +1434,7 @@ static void UpdateLayout() {
     if (!g_layoutDirty && g_textLayout) return;
     if (!g_dcomp) return;
     float maxW = (float)g_windowW - g_marginLeft * 2;
-    float maxH = (float)g_windowH - g_marginTop - 24.0f;
+    float maxH = (float)g_windowH - g_marginTop - 30.0f;
     if (maxW < 1) maxW = 1;
     if (maxH < 1) maxH = 1;
 
@@ -1297,7 +1489,7 @@ static void EnsureCursorVisible() {
     if (FAILED(g_textLayout->HitTestTextPosition((UINT32)g_cursorPos, FALSE, &px, &py, &hit)))
         return;
 
-    float visibleH = (float)g_windowH - g_marginTop - 24.0f;
+    float visibleH = (float)g_windowH - g_marginTop - 30.0f;
     float lineH = hit.height > 0 ? hit.height : g_fontSize * 1.15f;
 
     float currentScroll = g_dmanip ? g_dmanip->GetScrollY() : g_scrollY;
@@ -1343,8 +1535,6 @@ static void RenderEditor() {
     UpdateGutterWidth();
 
     ctx->Clear(D2D1::ColorF(0.10f, 0.10f, 0.12f));
-
-    float hintBarH = 20.0f;
 
     UpdateLayout();
 
@@ -1415,7 +1605,7 @@ static void RenderEditor() {
     }
 
     if (g_textLayout) {
-        D2D1_RECT_F editorClip = D2D1::RectF(0, g_statusBarH + g_menuBarH, (float)g_windowW, (float)g_windowH - hintBarH);
+        D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, (float)g_windowW, (float)g_windowH - 30.0f);
         ctx->PushAxisAlignedClip(editorClip, D2D1_ANTIALIAS_MODE_ALIASED);
 
         ComPtr<ID2D1SolidColorBrush> textBrush;
@@ -1495,10 +1685,6 @@ static void RenderEditor() {
         ctx->PopAxisAlignedClip();
     }
 
-    ComPtr<ID2D1SolidColorBrush> statusBgBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.14f, 0.14f, 0.16f), statusBgBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, 0, (float)g_windowW, g_statusBarH), statusBgBrush.Get());
-
     ComPtr<ID2D1SolidColorBrush> menuBarBgBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), menuBarBgBrush.GetAddressOf());
 
@@ -1508,32 +1694,21 @@ static void RenderEditor() {
     double periodMs = g_dcomp->GetStatistics().framePeriod / 10000.0;
     double fps = (periodMs > 0) ? 1000.0 / periodMs : 0;
 
-    wchar_t statusBuf[256];
-    _snwprintf_s(statusBuf, 256,
-        L"DComp Editor  |  %zu chars  |  Ln %zu  Col %zu  |  %.0f fps",
-        g_text.length(),
-        CountNewlinesBefore(g_cursorPos) + 1,
-        g_cursorPos - LastNewlineBefore(g_cursorPos),
-        fps);
-
     ComPtr<IDWriteTextFormat> statusFmt;
     g_dcomp->GetDWriteFactory()->CreateTextFormat(
         L"Segoe UI", nullptr,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us",
+        DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
         statusFmt.GetAddressOf());
     if (statusFmt) {
         statusFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         statusFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        ctx->DrawText(statusBuf, (UINT32)wcslen(statusBuf), statusFmt.Get(),
-            D2D1::RectF(12, 0, (float)g_windowW, g_statusBarH), statusBrush.Get());
     }
 
     ComPtr<ID2D1SolidColorBrush> separatorBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.28f), separatorBrush.GetAddressOf());
-    ctx->DrawLine(D2D1::Point2F(0, g_statusBarH), D2D1::Point2F((float)g_windowW, g_statusBarH), separatorBrush.Get(), 1.0f);
 
-    float menuY = g_statusBarH;
+    float menuY = 0;
     ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), menuBarBgBrush.Get());
 
     ComPtr<ID2D1SolidColorBrush> menuText;
@@ -1561,13 +1736,110 @@ static void RenderEditor() {
     ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F((float)g_windowW, menuY + g_menuBarH),
         separatorBrush.Get(), 1.0f);
 
-    ComPtr<ID2D1SolidColorBrush> hintBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.40f, 0.40f, 0.42f), hintBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), menuBarBgBrush.Get());
-    const wchar_t* hint = L"DirectComposition + D2D + DWrite  |  Ctrl+A/X/C/V  |  Esc=quit";
+    float tabBarY = menuY + g_menuBarH;
+    ComPtr<ID2D1SolidColorBrush> tabBarBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), tabBarBgBrush.GetAddressOf());
+    ctx->FillRectangle(D2D1::RectF(0, tabBarY, (float)g_windowW, tabBarY + g_tabBarH), tabBarBgBrush.Get());
+
+    ComPtr<ID2D1SolidColorBrush> tabActiveBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.12f), tabActiveBgBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> tabHoverBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.14f, 0.14f, 0.16f), tabHoverBgBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> tabTextBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.65f, 0.65f, 0.68f), tabTextBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> tabTextActiveBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.90f, 0.90f, 0.92f), tabTextActiveBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> tabCloseBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.52f), tabCloseBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> tabCloseHoverBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.30f, 0.30f), tabCloseHoverBrush.GetAddressOf());
+    ComPtr<IDWriteTextFormat> tabFmt;
+    g_dcomp->GetDWriteFactory()->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
+        tabFmt.GetAddressOf());
+    if (tabFmt) {
+        tabFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tabFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    float tabX = 0;
+    for (int i = 0; i < (int)g_tabs.size(); i++) {
+        const auto& t = g_tabs[i];
+        float textW = (float)(t.displayName.length()) * 8.0f;
+        float w = textW + g_tabPadX * 2 + (g_tabs.size() > 1 ? 20.0f : 0);
+        bool active = (i == g_activeTab);
+        bool hover = (i == g_tabHover);
+
+        if (active) {
+            ctx->FillRectangle(D2D1::RectF(tabX, tabBarY, tabX + w, tabBarY + g_tabBarH), tabActiveBgBrush.Get());
+        } else if (hover) {
+            ctx->FillRectangle(D2D1::RectF(tabX, tabBarY, tabX + w, tabBarY + g_tabBarH), tabHoverBgBrush.Get());
+        }
+
+        ctx->DrawLine(D2D1::Point2F(tabX + w, tabBarY + 4), D2D1::Point2F(tabX + w, tabBarY + g_tabBarH - 4),
+            separatorBrush.Get(), 1.0f);
+
+        if (tabFmt) {
+            wchar_t tabLabel[256];
+            _snwprintf_s(tabLabel, 256, L"%s%s", t.displayName.c_str(), t.dirty ? L" *" : L"");
+            ctx->DrawText(tabLabel, (UINT32)wcslen(tabLabel), tabFmt.Get(),
+                D2D1::RectF(tabX + g_tabPadX, tabBarY, tabX + w - (g_tabs.size() > 1 ? 20.0f : 0), tabBarY + g_tabBarH),
+                active ? tabTextActiveBrush.Get() : tabTextBrush.Get());
+        }
+
+        if (g_tabs.size() > 1) {
+            float closeX = tabX + w - 18.0f;
+            float closeY = tabBarY + (g_tabBarH - g_tabCloseSize) / 2.0f;
+            bool closeHov = (i == g_tabCloseHover);
+            auto* closeBrushPtr = closeHov ? tabCloseHoverBrush.Get() : tabCloseBrush.Get();
+            ctx->DrawLine(D2D1::Point2F(closeX, closeY), D2D1::Point2F(closeX + g_tabCloseSize, closeY + g_tabCloseSize),
+                closeBrushPtr, 1.2f);
+            ctx->DrawLine(D2D1::Point2F(closeX + g_tabCloseSize, closeY), D2D1::Point2F(closeX, closeY + g_tabCloseSize),
+                closeBrushPtr, 1.2f);
+        }
+
+        tabX += w;
+    }
+
+    ctx->DrawLine(D2D1::Point2F(0, tabBarY + g_tabBarH), D2D1::Point2F((float)g_windowW, tabBarY + g_tabBarH),
+        separatorBrush.Get(), 1.0f);
+
+    float footerH = 30.0f;
+    ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - footerH, (float)g_windowW, (float)g_windowH), menuBarBgBrush.Get());
+    ctx->DrawLine(D2D1::Point2F(0, (float)g_windowH - footerH), D2D1::Point2F((float)g_windowW, (float)g_windowH - footerH),
+        separatorBrush.Get(), 1.0f);
+
     if (statusFmt) {
-        ctx->DrawText(hint, (UINT32)wcslen(hint), statusFmt.Get(),
-            D2D1::RectF(12, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), hintBrush.Get());
+        wchar_t statusBuf[256];
+        _snwprintf_s(statusBuf, 256,
+            L"%zu chars  |  Ln %zu  Col %zu  |  %.0f fps",
+            g_text.length(),
+            CountNewlinesBefore(g_cursorPos) + 1,
+            g_cursorPos - LastNewlineBefore(g_cursorPos),
+            fps);
+        ComPtr<ID2D1SolidColorBrush> footerStatusBrush;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), footerStatusBrush.GetAddressOf());
+        ctx->DrawText(statusBuf, (UINT32)wcslen(statusBuf), statusFmt.Get(),
+            D2D1::RectF(12, (float)g_windowH - footerH, (float)g_windowW * 0.5f, (float)g_windowH),
+            footerStatusBrush.Get());
+
+        ComPtr<ID2D1SolidColorBrush> hintBrush;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.40f, 0.40f, 0.42f), hintBrush.GetAddressOf());
+        ComPtr<IDWriteTextFormat> hintFmt;
+        g_dcomp->GetDWriteFactory()->CreateTextFormat(
+            L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us",
+            hintFmt.GetAddressOf());
+        if (hintFmt) {
+            hintFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            hintFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            const wchar_t* hint = L"DirectComposition + D2D + DWrite";
+            ctx->DrawText(hint, (UINT32)wcslen(hint), hintFmt.Get(),
+                D2D1::RectF((float)g_windowW * 0.5f, (float)g_windowH - footerH, (float)g_windowW - 12, (float)g_windowH),
+                hintBrush.Get());
+        }
     }
 
     if (g_menuOpen >= 0) {
@@ -1725,6 +1997,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hwnd) { CoUninitialize(); return 1; }
+
+    BOOL darkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, 20, &darkMode, sizeof(darkMode));
 
     g_hwnd = hwnd;
     ShowWindow(hwnd, nCmdShow);

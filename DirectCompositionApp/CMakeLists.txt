@@ -58,6 +58,7 @@ target_link_libraries(DirectCompositionApp PRIVATE
     dxgi
     dcomp
     d2d1
+    dwmapi
     ole32
     uuid
 )
