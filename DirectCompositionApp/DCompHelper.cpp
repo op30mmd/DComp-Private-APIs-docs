@@ -33,6 +33,12 @@ bool DCompHelper::Initialize(HWND hwnd) {
     DBG_LOG("D3D11CreateDevice: 0x%08X", hr);
     if (FAILED(hr)) return false;
 
+    ComPtr<IDXGIDevice1> dxgiDevice1;
+    hr = m_d3dDevice.As(&dxgiDevice1);
+    if (SUCCEEDED(hr)) {
+        dxgiDevice1->SetMaximumFrameLatency(1);
+    }
+
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = m_d3dDevice.As(&dxgiDevice);
     if (FAILED(hr)) return false;
@@ -105,7 +111,7 @@ bool DCompHelper::CreateVisualTree() {
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
     hr = m_dxgiFactory->CreateSwapChainForComposition(
         m_d3dDevice.Get(), &scd, nullptr, m_swapChain.GetAddressOf());
@@ -131,8 +137,59 @@ bool DCompHelper::ResizeSwapChain(UINT width, UINT height) {
     m_swapWidth = width;
     m_swapHeight = height;
 
-    if (m_swapChain) {
-        m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (!m_firstPresentDone) return true;
+
+    if (m_swapChain && m_d2dContext) {
+        m_d2dContext->SetTarget(nullptr);
+
+        ComPtr<ID3D11DeviceContext> d3dContext;
+        m_d3dDevice->GetImmediateContext(d3dContext.GetAddressOf());
+        if (d3dContext) {
+            d3dContext->ClearState();
+            d3dContext->Flush();
+        }
+
+        HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(hr)) {
+            char buf[128];
+            sprintf_s(buf, "ResizeBuffers failed: 0x%08X\n", hr);
+            OutputDebugStringA(buf);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DCompHelper::TryFinishResize(HWND hwnd) {
+    if (!m_firstPresentDone) return true;
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    UINT w = rc.right - rc.left;
+    UINT h = rc.bottom - rc.top;
+    if (w == 0 || h == 0) return true;
+    if (w == m_swapWidth && h == m_swapHeight) return true;
+
+    m_swapWidth = w;
+    m_swapHeight = h;
+
+    if (m_swapChain && m_d2dContext) {
+        m_d2dContext->SetTarget(nullptr);
+
+        ComPtr<ID3D11DeviceContext> d3dContext;
+        m_d3dDevice->GetImmediateContext(d3dContext.GetAddressOf());
+        if (d3dContext) {
+            d3dContext->ClearState();
+            d3dContext->Flush();
+        }
+
+        HRESULT hr = m_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(hr)) {
+            char buf[128];
+            sprintf_s(buf, "TryFinishResize ResizeBuffers failed: 0x%08X\n", hr);
+            OutputDebugStringA(buf);
+            return false;
+        }
     }
     return true;
 }

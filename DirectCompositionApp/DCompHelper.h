@@ -13,6 +13,9 @@ class DCompHelper {
 public:
     bool Initialize(HWND hwnd);
     bool ResizeSwapChain(UINT width, UINT height);
+    bool TryFinishResize(HWND hwnd);
+    void MarkFirstPresent() { m_firstPresentDone = true; }
+    bool IsFirstPresentDone() const { return m_firstPresentDone; }
 
     IDXGISwapChain1* GetSwapChain() const { return m_swapChain.Get(); }
     ID2D1DeviceContext* GetD2DContext() const { return m_d2dContext.Get(); }
@@ -43,6 +46,7 @@ private:
 
     UINT m_swapWidth = 0;
     UINT m_swapHeight = 0;
+    bool m_firstPresentDone = false;
     COMPOSITION_FRAME_STATS m_stats = {};
     UINT64 m_lastFrameId = 0;
 };

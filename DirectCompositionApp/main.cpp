@@ -15,10 +15,26 @@
 #include <dwrite.h>
 #include <wrl.h>
 #include "DCompHelper.h"
+#include "TreeSitterHighlighter.h"
+#include "DirectManipHelper.h"
 
 using Microsoft::WRL::ComPtr;
 
 static std::unique_ptr<DCompHelper> g_dcomp;
+static ComPtr<DirectManipHelper> g_dmanip;
+static TreeSitterHighlighter g_highlighter;
+static std::wstring g_filePath;
+
+static bool IsCppFile(const std::wstring& path) {
+    if (path.empty()) return false;
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = path.substr(dot);
+    for (auto& c : ext) {
+        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+    }
+    return (ext == L".cpp" || ext == L".h" || ext == L".hpp" || ext == L".cc" || ext == L".cxx" || ext == L".c");
+}
 static HWND g_hwnd = nullptr;
 
 static std::wstring g_text;
@@ -27,9 +43,11 @@ static size_t g_selStart = 0;
 static size_t g_selEnd = 0;
 static float g_scrollY = 0;
 static bool g_caretVisible = true;
+static bool g_layoutDirty = true;
+static bool g_dragging = false;
 static int g_windowW = 800;
 static int g_windowH = 600;
-static const float g_marginLeft = 36.0f;
+static float g_marginLeft = 48.0f;
 static float g_marginTop = 62.0f;
 static const float g_fontSize = 16.0f;
 static const float g_menuBarH = 24.0f;
@@ -99,20 +117,45 @@ static int g_menuHover = -1;
 static int g_dropHover = -1;
 static bool g_menuTracking = false;
 
+static bool g_ctxOpen = false;
+static int g_ctxHover = -1;
+static float g_ctxX = 0;
+static float g_ctxY = 0;
+
 struct EditAction { size_t pos; std::wstring removed; std::wstring inserted; };
 static std::vector<EditAction> g_undoStack;
 static std::vector<EditAction> g_redoStack;
 
-static std::wstring g_filePath;
 static ComPtr<IDWriteTextFormat> g_menuFmt;
+
+static HCURSOR g_lastCursor = nullptr;
+static ComPtr<IDWriteTextFormat> g_lineNoFmt;
 static bool g_wordWrap = true;
 
 static void UpdateLayout();
 static void EnsureCursorVisible();
+static float GetTotalDocumentHeight();
 static void RenderEditor();
 static void HandleKey(WPARAM wParam);
 static size_t CountNewlinesBefore(size_t pos);
 static size_t LastNewlineBefore(size_t pos);
+
+static int GetLineCount() {
+    if (!g_textLayout) return 1;
+    UINT32 lineCount = 0;
+    g_textLayout->GetLineMetrics(nullptr, 0, &lineCount);
+    return (int)lineCount;
+}
+
+static void UpdateGutterWidth() {
+    int lines = GetLineCount();
+    if (lines < 1) lines = 1;
+    int digits = 1;
+    int n = lines;
+    while (n >= 10) { digits++; n /= 10; }
+    float pad = 8.0f;
+    g_marginLeft = pad + digits * 6.0f + 6.0f + pad;
+}
 
 static size_t ClampPos(size_t p) {
     if (p > g_text.length()) p = g_text.length();
@@ -169,6 +212,38 @@ static void CloseMenu() {
     g_menuTracking = false;
 }
 
+struct CtxMenuItem { const wchar_t* label; int action; bool separator; };
+static CtxMenuItem g_ctxItems[] = {
+    { L"Cut",         MA_CUT },
+    { L"Copy",        MA_COPY },
+    { L"Paste",       MA_PASTE },
+    { L"", MA_NONE, true },
+    { L"Select All",  MA_SELECTALL },
+};
+static const int g_ctxItemCount = 5;
+
+static void CloseCtxMenu() {
+    g_ctxOpen = false;
+    g_ctxHover = -1;
+}
+
+static int HitTestCtxMenu(float mx, float my) {
+    if (!g_ctxOpen) return -1;
+    float dw = 200.0f;
+    float dh = 24.0f;
+    if (mx < g_ctxX || mx > g_ctxX + dw || my < g_ctxY) return -1;
+    float iy = g_ctxY;
+    for (int i = 0; i < g_ctxItemCount; i++) {
+        float ih = g_ctxItems[i].separator ? 6.0f : dh;
+        if (my >= iy && my < iy + ih) {
+            if (!g_ctxItems[i].separator) return i;
+            return -1;
+        }
+        iy += ih;
+    }
+    return -1;
+}
+
 static void PushUndo(size_t pos, const std::wstring& del, const std::wstring& ins) {
     g_undoStack.push_back({ pos, del, ins });
     g_redoStack.clear();
@@ -210,31 +285,40 @@ static void DoOpen() {
     OPENFILENAMEW of = {};
     of.lStructSize = sizeof(of);
     of.hwndOwner = g_hwnd;
-    of.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    of.lpstrFilter = L"C++ Files (*.cpp;*.h;*.hpp;*.cc)\0*.cpp;*.h;*.hpp;*.cc\0Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
     of.lpstrFile = file;
     of.nMaxFile = MAX_PATH;
-    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&of)) {
-        HANDLE hFile = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD size = GetFileSize(hFile, nullptr);
-            if (size != INVALID_FILE_SIZE && size > 0) {
-                std::vector<char> buf(size);
-                DWORD read;
-                ReadFile(hFile, buf.data(), size, &read, nullptr);
-                int wlen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), size, nullptr, 0);
-                g_text.resize(wlen);
-                MultiByteToWideChar(CP_UTF8, 0, buf.data(), size, g_text.data(), wlen);
-            } else {
-                g_text.clear();
-            }
-            CloseHandle(hFile);
-            g_filePath = file;
-            g_cursorPos = g_selStart = g_selEnd = 0;
-            g_scrollY = 0;
-            g_undoStack.clear();
-            g_redoStack.clear();
+    of.lpstrTitle = L"Open";
+    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    BOOL ok = GetOpenFileNameW(&of);
+    if (!ok) {
+        DWORD err = CommDlgExtendedError();
+        if (err) {
+            wchar_t msg[128];
+            swprintf_s(msg, L"[Open] GetOpenFileNameW failed: CommDlgError=0x%04X\n", err);
+            OutputDebugStringW(msg);
         }
+        return;
+    }
+    HANDLE hFile = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD size = GetFileSize(hFile, nullptr);
+        if (size != INVALID_FILE_SIZE && size > 0) {
+            std::vector<char> buf(size);
+            DWORD read;
+            ReadFile(hFile, buf.data(), size, &read, nullptr);
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), size, nullptr, 0);
+            g_text.resize(wlen);
+            MultiByteToWideChar(CP_UTF8, 0, buf.data(), size, g_text.data(), wlen);
+        } else {
+            g_text.clear();
+        }
+        CloseHandle(hFile);
+        g_filePath = file;
+        g_cursorPos = g_selStart = g_selEnd = 0;
+        g_scrollY = 0;
+        g_undoStack.clear();
+        g_redoStack.clear();
     }
 }
 
@@ -373,6 +457,7 @@ static void ExecMenuAction(int action) {
     case MA_ABOUT:
         break;
     }
+    g_layoutDirty = true;
     EnsureCursorVisible();
     Invalidate();
 }
@@ -383,6 +468,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         g_dcomp = std::make_unique<DCompHelper>();
         if (!g_dcomp->Initialize(hwnd)) {
             OutputDebugStringA("[Editor] DComp init failed\n");
+        }
+
+        g_dmanip = new DirectManipHelper();
+        if (g_dmanip->Initialize(hwnd)) {
+            OutputDebugStringA("[Editor] DirectManip initialized\n");
+        } else {
+            g_dmanip.Reset();
+        }
+
+        if (!g_highlighter.Initialize()) {
+            OutputDebugStringA("[Editor] Tree-sitter highlighter init failed\n");
         }
 
         g_dcomp->GetDWriteFactory()->CreateTextFormat(
@@ -412,6 +508,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_menuFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
 
+        g_dcomp->GetDWriteFactory()->CreateTextFormat(
+            L"Cascadia Mono", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
+            g_lineNoFmt.GetAddressOf());
+        if (!g_lineNoFmt) {
+            g_dcomp->GetDWriteFactory()->CreateTextFormat(
+                L"Consolas", nullptr,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
+                g_lineNoFmt.GetAddressOf());
+        }
+        if (g_lineNoFmt) {
+            g_lineNoFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            g_lineNoFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+
         InitMenuBar();
         SetTimer(hwnd, 1, 500, nullptr);
         return 0;
@@ -422,13 +535,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         BeginPaint(hwnd, &ps);
         EndPaint(hwnd, &ps);
         g_marginTop = 62.0f;
+        if (g_dmanip) {
+            g_dmanip->Update();
+            g_scrollY = g_dmanip->GetScrollY();
+        }
         g_dcomp->UpdateFrameStatistics();
         RenderEditor();
+
+        if (g_dmanip && g_dmanip->IsAnimating()) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     }
 
     case WM_CHAR:
-        if (wParam == 27) return 0;
+        if (wParam == 27) {
+            if (g_ctxOpen) {
+                CloseCtxMenu();
+                Invalidate();
+            }
+            return 0;
+        }
         if (wParam == 1) {
             g_selStart = 0;
             g_selEnd = g_text.length();
@@ -484,6 +611,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (wParam == 26) {
                 g_cursorPos = g_selStart = g_selEnd;
             }
+            g_layoutDirty = true;
             EnsureCursorVisible();
             Invalidate();
             return 0;
@@ -499,6 +627,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_cursorPos++;
             g_selStart = g_selEnd = g_cursorPos;
             g_caretVisible = true;
+            g_layoutDirty = true;
             EnsureCursorVisible();
             Invalidate();
         }
@@ -511,6 +640,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_LBUTTONDOWN: {
         float mx = (float)GET_X_LPARAM(lParam);
         float my = (float)GET_Y_LPARAM(lParam);
+
+        if (g_ctxOpen) {
+            int item = HitTestCtxMenu(mx, my);
+            if (item >= 0) {
+                ExecMenuAction(g_ctxItems[item].action);
+            }
+            CloseCtxMenu();
+            Invalidate();
+            return 0;
+        }
 
         if (g_menuOpen >= 0) {
             int item = HitTestDropdown(mx, my);
@@ -525,6 +664,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         int menu = HitTestMenuBar(mx, my);
         if (menu >= 0) {
+            CloseCtxMenu();
             g_menuOpen = menu;
             g_dropHover = -1;
             g_menuTracking = true;
@@ -534,12 +674,107 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         CloseMenu();
         SetFocus(hwnd);
+
+        if (g_textLayout && mx >= g_marginLeft) {
+            float textX = mx - g_marginLeft;
+            float textY = my - g_marginTop + g_scrollY;
+            BOOL isTrailing, isInside;
+            UINT32 pos = 0;
+            DWRITE_HIT_TEST_METRICS hit;
+            if (SUCCEEDED(g_textLayout->HitTestPoint(textX, textY, &isTrailing, &isInside, &hit))) {
+                pos = hit.textPosition;
+                if (isTrailing && pos < g_text.length()) pos++;
+            }
+
+            if (wParam & MK_SHIFT) {
+                g_selEnd = pos;
+            } else {
+                g_selStart = pos;
+                g_selEnd = pos;
+            }
+            g_cursorPos = pos;
+            g_caretVisible = true;
+            g_dragging = true;
+            SetCapture(hwnd);
+            Invalidate();
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (g_dragging) {
+            g_dragging = false;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONUP: {
+        float mx = (float)GET_X_LPARAM(lParam);
+        float my = (float)GET_Y_LPARAM(lParam);
+
+        if (g_menuOpen >= 0) return 0;
+
+        int menu = HitTestMenuBar(mx, my);
+        if (menu >= 0) return 0;
+
+        if (g_ctxOpen) {
+            int item = HitTestCtxMenu(mx, my);
+            if (item >= 0) {
+                ExecMenuAction(g_ctxItems[item].action);
+            }
+            CloseCtxMenu();
+            Invalidate();
+            return 0;
+        }
+
+        if (g_textLayout && mx >= g_marginLeft && my >= g_marginTop) {
+            float textX = mx - g_marginLeft;
+            float textY = my - g_marginTop + g_scrollY;
+            BOOL isTrailing, isInside;
+            UINT32 pos = 0;
+            DWRITE_HIT_TEST_METRICS hit;
+            if (SUCCEEDED(g_textLayout->HitTestPoint(textX, textY, &isTrailing, &isInside, &hit))) {
+                pos = hit.textPosition;
+                if (isTrailing && pos < g_text.length()) pos++;
+            }
+            if (g_selStart == g_selEnd) {
+                g_selStart = pos;
+                g_selEnd = pos;
+                g_cursorPos = pos;
+            }
+
+            float dw = 200.0f;
+            float dh = 0;
+            for (int i = 0; i < g_ctxItemCount; i++)
+                dh += g_ctxItems[i].separator ? 6.0f : 24.0f;
+
+            float cx = mx;
+            float cy = my;
+            if (cx + dw > (float)g_windowW) cx = (float)g_windowW - dw - 4;
+            if (cy + dh > (float)g_windowH) cy = (float)g_windowH - dh - 4;
+
+            g_ctxX = cx;
+            g_ctxY = cy;
+            g_ctxOpen = true;
+            g_ctxHover = -1;
+            Invalidate();
+        }
         return 0;
     }
 
     case WM_MOUSEMOVE: {
         float mx = (float)GET_X_LPARAM(lParam);
         float my = (float)GET_Y_LPARAM(lParam);
+
+        if (g_ctxOpen) {
+            int item = HitTestCtxMenu(mx, my);
+            if (item != g_ctxHover) {
+                g_ctxHover = item;
+                Invalidate();
+            }
+            return 0;
+        }
 
         if (g_menuTracking) {
             int menu = HitTestMenuBar(mx, my);
@@ -555,13 +790,46 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
+        if (g_dragging && g_textLayout && mx >= g_marginLeft) {
+            float textX = mx - g_marginLeft;
+            float textY = my - g_marginTop + g_scrollY;
+            BOOL isTrailing, isInside;
+            UINT32 pos = 0;
+            DWRITE_HIT_TEST_METRICS hit;
+            if (SUCCEEDED(g_textLayout->HitTestPoint(textX, textY, &isTrailing, &isInside, &hit))) {
+                pos = hit.textPosition;
+                if (isTrailing && pos < g_text.length()) pos++;
+            }
+            g_selEnd = pos;
+            g_cursorPos = pos;
+            g_caretVisible = true;
+            Invalidate();
+            return 0;
+        }
+
         bool inMenuBar = (my >= g_statusBarH && my < g_statusBarH + g_menuBarH);
+        bool inStatusBar = (my < g_statusBarH);
+        bool inHintBar = (my >= g_windowH - 20);
         int menu = HitTestMenuBar(mx, my);
         if (menu != g_menuHover) {
             g_menuHover = menu;
             Invalidate();
         }
-        SetCursor(LoadCursor(nullptr, inMenuBar ? IDC_HAND : IDC_IBEAM));
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        float visibleH = (float)g_windowH - g_marginTop - 24.0f;
+        float totalH = GetTotalDocumentHeight();
+        float currentScroll = g_dmanip ? g_dmanip->GetScrollY() : g_scrollY;
+        float newScroll = currentScroll - (float)delta * 0.5f;
+        if (totalH > 0 && newScroll > totalH - visibleH) newScroll = totalH - visibleH;
+        if (newScroll < 0) newScroll = 0;
+        if (g_dmanip) {
+            g_dmanip->SetContentHeight(totalH);
+            g_dmanip->ScrollTo(newScroll, FALSE);
+        }
         return 0;
     }
 
@@ -573,17 +841,58 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_SETCURSOR: {
+        if (LOWORD(lParam) != HTCLIENT) {
+            g_lastCursor = nullptr;
+            return DefWindowProcW(hwnd, WM_SETCURSOR, wParam, lParam);
+        }
+
         POINT pt;
         GetCursorPos(&pt);
-        ScreenToClient(g_hwnd, &pt);
-        bool inMenuBar = (pt.y >= g_statusBarH && pt.y < g_statusBarH + g_menuBarH);
-        SetCursor(LoadCursor(nullptr, inMenuBar || g_menuOpen >= 0 ? IDC_HAND : IDC_IBEAM));
+        ScreenToClient(hwnd, &pt);
+
+        LPCWSTR cursorId = IDC_IBEAM;
+
+        if (g_dragging) {
+            cursorId = IDC_IBEAM;
+        } else if (g_ctxOpen) {
+            int item = HitTestCtxMenu((float)pt.x, (float)pt.y);
+            cursorId = item >= 0 ? IDC_HAND : IDC_ARROW;
+        } else {
+            bool overDropdown = false;
+            if (g_menuOpen >= 0) {
+                int item = HitTestDropdown((float)pt.x, (float)pt.y);
+                overDropdown = (item >= 0);
+            }
+
+            bool inMenuBar = (pt.y >= g_statusBarH && pt.y < g_statusBarH + g_menuBarH);
+            bool inStatusBar = (pt.y < g_statusBarH);
+            bool inHintBar = (pt.y >= g_windowH - 20);
+            bool inGutter = (pt.x < g_marginLeft);
+
+            if (inMenuBar || overDropdown) {
+                cursorId = IDC_HAND;
+            } else if (inStatusBar || inHintBar || inGutter) {
+                cursorId = IDC_ARROW;
+            } else {
+                cursorId = IDC_IBEAM;
+            }
+        }
+
+        HCURSOR loaded = LoadCursor(nullptr, cursorId);
+        if (loaded != g_lastCursor) {
+            g_lastCursor = loaded;
+            SetCursor(loaded);
+        }
         return 1;
     }
 
     case WM_TIMER:
         if (wParam == 1) {
             g_caretVisible = !g_caretVisible;
+            Invalidate();
+        } else if (wParam == 3) {
+            KillTimer(hwnd, 3);
+            g_dcomp->TryFinishResize(hwnd);
             Invalidate();
         }
         return 0;
@@ -596,7 +905,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         if (w > 0 && h > 0) {
             g_windowW = w;
             g_windowH = h;
+            g_layoutDirty = true;
             g_dcomp->ResizeSwapChain(w, h);
+            if (g_dmanip) {
+                float visibleH = (float)h - 62.0f - 24.0f;
+                if (visibleH < 1) visibleH = 1;
+                g_dmanip->SetViewportSize((float)w, visibleH);
+            }
             EnsureCursorVisible();
             Invalidate();
         }
@@ -607,6 +922,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
         mmi->ptMinTrackSize.x = 400;
         mmi->ptMinTrackSize.y = 300;
+        RECT workArea = {};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+        mmi->ptMaxPosition.x = workArea.left;
+        mmi->ptMaxPosition.y = workArea.top;
+        mmi->ptMaxSize.x = workArea.right - workArea.left;
+        mmi->ptMaxSize.y = workArea.bottom - workArea.top;
         return 0;
     }
 
@@ -616,8 +937,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         g_dcomp.reset();
+        g_dmanip.Reset();
         PostQuitMessage(0);
         return 0;
+
+    case WM_POINTERDOWN: {
+        UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+        if (g_dmanip) {
+            g_dmanip->AddContact(pointerId);
+            BOOL handled = FALSE;
+            MSG msg = { hwnd, uMsg, wParam, lParam };
+            g_dmanip->ProcessInput(&msg, &handled);
+            if (handled) {
+                g_dmanip->Update();
+                return 0;
+            }
+        }
+        break;
+    }
+
+    default:
+        if (g_dmanip) {
+            BOOL handled = FALSE;
+            MSG msg = { hwnd, uMsg, wParam, lParam };
+            g_dmanip->ProcessInput(&msg, &handled);
+            if (handled) {
+                g_dmanip->Update();
+                return 0;
+            }
+        }
+        break;
     }
 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
@@ -827,6 +1176,7 @@ static void HandleKey(WPARAM wParam) {
         }
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
+        g_layoutDirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -841,6 +1191,7 @@ static void HandleKey(WPARAM wParam) {
         }
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
+        g_layoutDirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -855,6 +1206,7 @@ static void HandleKey(WPARAM wParam) {
         g_cursorPos++;
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
+        g_layoutDirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -869,6 +1221,7 @@ static void HandleKey(WPARAM wParam) {
         g_cursorPos += 4;
         g_selStart = g_selEnd = g_cursorPos;
         g_caretVisible = true;
+        g_layoutDirty = true;
         EnsureCursorVisible();
         Invalidate();
         break;
@@ -876,7 +1229,17 @@ static void HandleKey(WPARAM wParam) {
     g_caretVisible = true;
 }
 
+static std::string WToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.length(), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string result(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.length(), &result[0], len, nullptr, nullptr);
+    return result;
+}
+
 static void UpdateLayout() {
+    if (!g_layoutDirty && g_textLayout) return;
     if (!g_dcomp) return;
     float maxW = (float)g_windowW - g_marginLeft * 2;
     float maxH = (float)g_windowH - g_marginTop - 24.0f;
@@ -893,6 +1256,36 @@ static void UpdateLayout() {
     if (g_textLayout) {
         g_textLayout->SetWordWrapping(g_wordWrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
     }
+
+    if (IsCppFile(g_filePath)) {
+        std::string utf8 = WToUtf8(g_text);
+        g_highlighter.UpdateSource(utf8.c_str(), (uint32_t)utf8.size());
+    } else {
+        g_highlighter.UpdateSource("", 0);
+    }
+
+    if (g_dmanip && g_textLayout) {
+        float totalH = GetTotalDocumentHeight();
+        g_dmanip->SetContentHeight(totalH);
+    }
+
+    g_layoutDirty = false;
+}
+
+static float GetTotalDocumentHeight() {
+    float totalH = 0;
+    if (g_textLayout) {
+        UINT32 lc = 0;
+        g_textLayout->GetLineMetrics(nullptr, 0, &lc);
+        if (lc > 0) {
+            std::vector<DWRITE_LINE_METRICS> lm(lc);
+            g_textLayout->GetLineMetrics(lm.data(), lc, &lc);
+            for (UINT32 i = 0; i < lc; i++) {
+                totalH += lm[i].height;
+            }
+        }
+    }
+    return totalH;
 }
 
 static void EnsureCursorVisible() {
@@ -907,12 +1300,25 @@ static void EnsureCursorVisible() {
     float visibleH = (float)g_windowH - g_marginTop - 24.0f;
     float lineH = hit.height > 0 ? hit.height : g_fontSize * 1.15f;
 
-    if (py < g_scrollY) {
-        g_scrollY = py;
-    } else if (py + lineH > g_scrollY + visibleH) {
-        g_scrollY = py + lineH - visibleH;
+    float currentScroll = g_dmanip ? g_dmanip->GetScrollY() : g_scrollY;
+    float newScrollY = currentScroll;
+    if (py < newScrollY) {
+        newScrollY = py;
+    } else if (py + lineH > newScrollY + visibleH) {
+        newScrollY = py + lineH - visibleH;
     }
-    if (g_scrollY < 0) g_scrollY = 0;
+    if (newScrollY < 0) newScrollY = 0;
+
+    if (fabsf(newScrollY - currentScroll) > 0.5f) {
+        if (g_dmanip) {
+            float totalH = GetTotalDocumentHeight();
+            g_dmanip->SetContentHeight(totalH);
+            g_dmanip->ScrollTo(newScrollY, FALSE);
+        } else {
+            g_scrollY = newScrollY;
+            Invalidate();
+        }
+    }
 }
 
 static void RenderEditor() {
@@ -934,154 +1340,84 @@ static void RenderEditor() {
     ctx->SetTarget(targetBitmap.Get());
     ctx->BeginDraw();
 
+    UpdateGutterWidth();
+
     ctx->Clear(D2D1::ColorF(0.10f, 0.10f, 0.12f));
 
     float hintBarH = 20.0f;
 
-    ComPtr<ID2D1SolidColorBrush> statusBgBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.14f, 0.14f, 0.16f), statusBgBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, 0, (float)g_windowW, g_statusBarH), statusBgBrush.Get());
-
-    ComPtr<ID2D1SolidColorBrush> statusBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.70f, 0.70f, 0.70f), statusBrush.GetAddressOf());
-
-    double periodMs = g_dcomp->GetStatistics().framePeriod / 10000.0;
-    double fps = (periodMs > 0) ? 1000.0 / periodMs : 0;
-
-    wchar_t statusBuf[256];
-    _snwprintf_s(statusBuf, 256,
-        L"DComp Editor  |  %zu chars  |  Ln %zu  Col %zu  |  %.0f fps",
-        g_text.length(),
-        CountNewlinesBefore(g_cursorPos) + 1,
-        g_cursorPos - LastNewlineBefore(g_cursorPos),
-        fps);
-
-    ComPtr<IDWriteTextFormat> statusFmt;
-    g_dcomp->GetDWriteFactory()->CreateTextFormat(
-        L"Segoe UI", nullptr,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us",
-        statusFmt.GetAddressOf());
-    if (statusFmt) {
-        statusFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        statusFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        ctx->DrawText(statusBuf, (UINT32)wcslen(statusBuf), statusFmt.Get(),
-            D2D1::RectF(12, 0, (float)g_windowW, g_statusBarH), statusBrush.Get());
-    }
-
-    ComPtr<ID2D1SolidColorBrush> separatorBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.28f), separatorBrush.GetAddressOf());
-    ctx->DrawLine(D2D1::Point2F(0, g_statusBarH), D2D1::Point2F((float)g_windowW, g_statusBarH), separatorBrush.Get(), 1.0f);
-
-    {
-        float menuY = g_statusBarH;
-        ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), statusBgBrush.Get());
-
-        ComPtr<ID2D1SolidColorBrush> menuText;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.80f, 0.82f), menuText.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> menuTextActive;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f), menuTextActive.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> menuHighlight;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), menuHighlight.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropBg;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), dropBg.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropHighlight;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), dropHighlight.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropText;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f), dropText.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropShortcut;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), dropShortcut.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropSep;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f), dropSep.GetAddressOf());
-        ComPtr<ID2D1SolidColorBrush> dropBorder;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f), dropBorder.GetAddressOf());
-
-        for (int i = 0; i < g_menuCount; i++) {
-            float mx = g_menus[i].x;
-            float mw = g_menus[i].w;
-            bool active = (i == g_menuOpen) || (i == g_menuHover && g_menuOpen < 0);
-
-            if (active) {
-                ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuHighlight.Get());
-            }
-
-            g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
-                D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH),
-                active ? menuTextActive.Get() : menuText.Get());
-        }
-
-        ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F((float)g_windowW, menuY + g_menuBarH),
-            separatorBrush.Get(), 1.0f);
-
-        if (g_menuOpen >= 0) {
-            MenuDef& m = g_menus[g_menuOpen];
-            float dropW = 240.0f;
-            float dropX = m.x;
-            float dropY = menuY + g_menuBarH;
-
-            float totalH = 0;
-            for (int i = 0; i < m.count; i++)
-                totalH += m.items[i].separator ? 6.0f : 24.0f;
-
-            ctx->FillRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBg.Get());
-            ctx->DrawRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBorder.Get(), 1.0f);
-
-            float iy = dropY;
-            for (int i = 0; i < m.count; i++) {
-                MenuItem& item = m.items[i];
-                if (item.separator) {
-                    ctx->DrawLine(D2D1::Point2F(dropX + 8, iy + 3), D2D1::Point2F(dropX + dropW - 8, iy + 3),
-                        dropSep.Get(), 1.0f);
-                    iy += 6.0f;
-                } else {
-                    float ih = 24.0f;
-                    bool hovered = (i == g_dropHover);
-
-                    if (hovered) {
-                        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(dropX + 2, iy + 1, dropX + dropW - 2, iy + ih - 1), 2, 2);
-                        ctx->FillRoundedRectangle(rr, dropHighlight.Get());
-                    }
-
-                    g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
-                        D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih),
-                        hovered ? menuTextActive.Get() : dropText.Get());
-
-                    if (item.shortcut[0]) {
-                        ComPtr<IDWriteTextFormat> scFmt;
-                        g_dcomp->GetDWriteFactory()->CreateTextFormat(
-                            L"Segoe UI", nullptr,
-                            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                            DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us",
-                            scFmt.GetAddressOf());
-                        if (scFmt) {
-                            scFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                            scFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                            ctx->DrawText(item.shortcut, (UINT32)wcslen(item.shortcut), scFmt.Get(),
-                                D2D1::RectF(dropX + dropW - 75, iy, dropX + dropW - 8, iy + ih),
-                                dropShortcut.Get());
-                        }
-                    }
-
-                    iy += ih;
-                }
-            }
-        }
-    }
-
-    ComPtr<ID2D1SolidColorBrush> hintBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.40f, 0.40f, 0.42f), hintBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), statusBgBrush.Get());
-    const wchar_t* hint = L"DirectComposition + D2D + DWrite  |  Ctrl+A/X/C/V  |  Esc=quit";
-    if (statusFmt) {
-        ctx->DrawText(hint, (UINT32)wcslen(hint), statusFmt.Get(),
-            D2D1::RectF(12, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), hintBrush.Get());
-    }
-
     UpdateLayout();
 
+    if (g_textLayout && IsCppFile(g_filePath) && g_highlighter.GetHighlights().size() > 0) {
+        auto ctx2 = g_dcomp->GetD2DContext();
+        const std::string& utf8 = WToUtf8(g_text);
+
+        std::vector<uint32_t> utf8ToUtf16;
+        utf8ToUtf16.reserve(utf8.size() + 1);
+        uint32_t utf16Idx = 0;
+        for (size_t i = 0; i < g_text.length(); i++) {
+            wchar_t wc = g_text[i];
+            int bytes = 0;
+            if (wc < 0x80) {
+                bytes = 1;
+            } else if (wc < 0x800) {
+                bytes = 2;
+            } else if (wc >= 0xD800 && wc <= 0xDBFF) {
+                bytes = 4;
+                i++;
+            } else {
+                bytes = 3;
+            }
+            for (int b = 0; b < bytes; b++) {
+                utf8ToUtf16.push_back(utf16Idx);
+            }
+            utf16Idx += (bytes == 4) ? 2 : 1;
+        }
+        utf8ToUtf16.push_back(utf16Idx);
+
+        for (auto& hl : g_highlighter.GetHighlights()) {
+            if (hl.startByte >= utf8ToUtf16.size() || hl.endByte > utf8ToUtf16.size()) continue;
+            uint32_t startChar = utf8ToUtf16[hl.startByte];
+            uint32_t endChar = utf8ToUtf16[hl.endByte];
+            if (startChar >= endChar) continue;
+
+            D2D1_COLOR_F color;
+            const char* name = hl.captureName;
+            if (strstr(name, "keyword")) {
+                color = D2D1::ColorF(0.56f, 0.78f, 0.96f);
+            } else if (strstr(name, "function")) {
+                color = D2D1::ColorF(0.78f, 0.82f, 0.56f);
+            } else if (strstr(name, "type")) {
+                color = D2D1::ColorF(0.86f, 0.60f, 0.45f);
+            } else if (strstr(name, "string")) {
+                color = D2D1::ColorF(0.65f, 0.82f, 0.56f);
+            } else if (strstr(name, "comment")) {
+                color = D2D1::ColorF(0.45f, 0.52f, 0.40f);
+            } else if (strstr(name, "number")) {
+                color = D2D1::ColorF(0.82f, 0.68f, 0.90f);
+            } else if (strstr(name, "operator")) {
+                color = D2D1::ColorF(0.75f, 0.75f, 0.78f);
+            } else if (strstr(name, "constant")) {
+                color = D2D1::ColorF(0.86f, 0.72f, 0.50f);
+            } else if (strstr(name, "property")) {
+                color = D2D1::ColorF(0.70f, 0.80f, 0.88f);
+            } else if (strstr(name, "variable")) {
+                color = D2D1::ColorF(0.88f, 0.88f, 0.88f);
+            } else {
+                continue;
+            }
+
+            ComPtr<ID2D1SolidColorBrush> brush;
+            ctx2->CreateSolidColorBrush(color, brush.GetAddressOf());
+            DWRITE_TEXT_RANGE range = { startChar, endChar - startChar };
+            g_textLayout->SetDrawingEffect(brush.Get(), range);
+        }
+    }
+
     if (g_textLayout) {
+        D2D1_RECT_F editorClip = D2D1::RectF(0, g_statusBarH + g_menuBarH, (float)g_windowW, (float)g_windowH - hintBarH);
+        ctx->PushAxisAlignedClip(editorClip, D2D1_ANTIALIAS_MODE_ALIASED);
+
         ComPtr<ID2D1SolidColorBrush> textBrush;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.88f, 0.88f, 0.88f), textBrush.GetAddressOf());
 
@@ -1145,15 +1481,211 @@ static void RenderEditor() {
                 if (ly + lh >= 0 && ly <= (float)g_windowH) {
                     wchar_t num[8];
                     _snwprintf_s(num, 8, L"%u", i + 1);
-                    float numW = 20.0f;
-                    ctx->DrawText(num, (UINT32)wcslen(num), g_textFormat.Get(),
-                        D2D1::RectF(6, ly, g_marginLeft - 8, ly + lh), lineNoBrush.Get(),
+                    ctx->DrawText(num, (UINT32)wcslen(num), g_lineNoFmt.Get(),
+                        D2D1::RectF(4, ly, g_marginLeft - 8, ly + lh), lineNoBrush.Get(),
                         D2D1_DRAW_TEXT_OPTIONS_NO_SNAP);
                 }
 
                 lineY += lh;
                 pos += metrics[i].length;
                 if (pos > g_text.length()) break;
+            }
+        }
+
+        ctx->PopAxisAlignedClip();
+    }
+
+    ComPtr<ID2D1SolidColorBrush> statusBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.14f, 0.14f, 0.16f), statusBgBrush.GetAddressOf());
+    ctx->FillRectangle(D2D1::RectF(0, 0, (float)g_windowW, g_statusBarH), statusBgBrush.Get());
+
+    ComPtr<ID2D1SolidColorBrush> menuBarBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), menuBarBgBrush.GetAddressOf());
+
+    ComPtr<ID2D1SolidColorBrush> statusBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.70f, 0.70f, 0.70f), statusBrush.GetAddressOf());
+
+    double periodMs = g_dcomp->GetStatistics().framePeriod / 10000.0;
+    double fps = (periodMs > 0) ? 1000.0 / periodMs : 0;
+
+    wchar_t statusBuf[256];
+    _snwprintf_s(statusBuf, 256,
+        L"DComp Editor  |  %zu chars  |  Ln %zu  Col %zu  |  %.0f fps",
+        g_text.length(),
+        CountNewlinesBefore(g_cursorPos) + 1,
+        g_cursorPos - LastNewlineBefore(g_cursorPos),
+        fps);
+
+    ComPtr<IDWriteTextFormat> statusFmt;
+    g_dcomp->GetDWriteFactory()->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us",
+        statusFmt.GetAddressOf());
+    if (statusFmt) {
+        statusFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        statusFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        ctx->DrawText(statusBuf, (UINT32)wcslen(statusBuf), statusFmt.Get(),
+            D2D1::RectF(12, 0, (float)g_windowW, g_statusBarH), statusBrush.Get());
+    }
+
+    ComPtr<ID2D1SolidColorBrush> separatorBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.28f), separatorBrush.GetAddressOf());
+    ctx->DrawLine(D2D1::Point2F(0, g_statusBarH), D2D1::Point2F((float)g_windowW, g_statusBarH), separatorBrush.Get(), 1.0f);
+
+    float menuY = g_statusBarH;
+    ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), menuBarBgBrush.Get());
+
+    ComPtr<ID2D1SolidColorBrush> menuText;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.80f, 0.82f), menuText.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> menuTextActive;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f), menuTextActive.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> menuHighlight;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), menuHighlight.GetAddressOf());
+
+    for (int i = 0; i < g_menuCount; i++) {
+        float mx = g_menus[i].x;
+        float mw = g_menus[i].w;
+        bool active = (i == g_menuOpen) || (i == g_menuHover && g_menuOpen < 0);
+
+        if (active) {
+            ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuHighlight.Get());
+        }
+
+        g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
+            D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH),
+            active ? menuTextActive.Get() : menuText.Get());
+    }
+
+    ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F((float)g_windowW, menuY + g_menuBarH),
+        separatorBrush.Get(), 1.0f);
+
+    ComPtr<ID2D1SolidColorBrush> hintBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.40f, 0.40f, 0.42f), hintBrush.GetAddressOf());
+    ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), menuBarBgBrush.Get());
+    const wchar_t* hint = L"DirectComposition + D2D + DWrite  |  Ctrl+A/X/C/V  |  Esc=quit";
+    if (statusFmt) {
+        ctx->DrawText(hint, (UINT32)wcslen(hint), statusFmt.Get(),
+            D2D1::RectF(12, (float)g_windowH - hintBarH, (float)g_windowW, (float)g_windowH), hintBrush.Get());
+    }
+
+    if (g_menuOpen >= 0) {
+        ComPtr<ID2D1SolidColorBrush> dropBg;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), dropBg.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> dropHighlight;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), dropHighlight.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> dropText;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f), dropText.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> dropShortcut;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), dropShortcut.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> dropSep;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f), dropSep.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> dropBorder;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f), dropBorder.GetAddressOf());
+
+        MenuDef& m = g_menus[g_menuOpen];
+        float dropW = 240.0f;
+        float dropX = m.x;
+        float dropY = menuY + g_menuBarH;
+
+        float totalH = 0;
+        for (int i = 0; i < m.count; i++)
+            totalH += m.items[i].separator ? 6.0f : 24.0f;
+
+        ctx->FillRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBg.Get());
+        ctx->DrawRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBorder.Get(), 1.0f);
+
+        float iy = dropY;
+        for (int i = 0; i < m.count; i++) {
+            MenuItem& item = m.items[i];
+            if (item.separator) {
+                ctx->DrawLine(D2D1::Point2F(dropX + 8, iy + 3), D2D1::Point2F(dropX + dropW - 8, iy + 3),
+                    dropSep.Get(), 1.0f);
+                iy += 6.0f;
+            } else {
+                float ih = 24.0f;
+                bool hovered = (i == g_dropHover);
+
+                if (hovered) {
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(dropX + 2, iy + 1, dropX + dropW - 2, iy + ih - 1), 2, 2);
+                    ctx->FillRoundedRectangle(rr, dropHighlight.Get());
+                }
+
+                g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                    D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih),
+                    hovered ? menuTextActive.Get() : dropText.Get());
+
+                if (item.shortcut[0]) {
+                    ComPtr<IDWriteTextFormat> scFmt;
+                    g_dcomp->GetDWriteFactory()->CreateTextFormat(
+                        L"Segoe UI", nullptr,
+                        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us",
+                        scFmt.GetAddressOf());
+                    if (scFmt) {
+                        scFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        scFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        ctx->DrawText(item.shortcut, (UINT32)wcslen(item.shortcut), scFmt.Get(),
+                            D2D1::RectF(dropX + dropW - 75, iy, dropX + dropW - 8, iy + ih),
+                            dropShortcut.Get());
+                    }
+                }
+
+                iy += ih;
+            }
+        }
+    }
+
+    if (g_ctxOpen) {
+        ComPtr<ID2D1SolidColorBrush> ctxBg;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), ctxBg.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> ctxHighlight;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), ctxHighlight.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> ctxText;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f), ctxText.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> ctxTextDim;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.45f, 0.45f, 0.48f), ctxTextDim.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> ctxSep;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f), ctxSep.GetAddressOf());
+        ComPtr<ID2D1SolidColorBrush> ctxBorder;
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f), ctxBorder.GetAddressOf());
+
+        float dw = 200.0f;
+        float totalH = 0;
+        for (int i = 0; i < g_ctxItemCount; i++)
+            totalH += g_ctxItems[i].separator ? 6.0f : 24.0f;
+
+        ctx->FillRectangle(D2D1::RectF(g_ctxX, g_ctxY, g_ctxX + dw, g_ctxY + totalH), ctxBg.Get());
+        ctx->DrawRectangle(D2D1::RectF(g_ctxX, g_ctxY, g_ctxX + dw, g_ctxY + totalH), ctxBorder.Get(), 1.0f);
+
+        bool hasSel = (g_selStart != g_selEnd);
+
+        float iy = g_ctxY;
+        for (int i = 0; i < g_ctxItemCount; i++) {
+            CtxMenuItem& item = g_ctxItems[i];
+            if (item.separator) {
+                ctx->DrawLine(D2D1::Point2F(g_ctxX + 8, iy + 3), D2D1::Point2F(g_ctxX + dw - 8, iy + 3),
+                    ctxSep.Get(), 1.0f);
+                iy += 6.0f;
+            } else {
+                float ih = 24.0f;
+                bool hovered = (i == g_ctxHover);
+                bool enabled = true;
+                if (item.action == MA_CUT || item.action == MA_COPY)
+                    enabled = hasSel;
+
+                if (hovered) {
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(g_ctxX + 2, iy + 1, g_ctxX + dw - 2, iy + ih - 1), 2, 2);
+                    ctx->FillRoundedRectangle(rr, ctxHighlight.Get());
+                }
+
+                g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                    D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih),
+                    enabled ? (hovered ? menuTextActive.Get() : ctxText.Get()) : ctxTextDim.Get());
+                iy += ih;
             }
         }
     }
@@ -1163,18 +1695,27 @@ static void RenderEditor() {
         OutputDebugStringA("[Editor] D2D device lost, recreating\n");
     }
 
+    ctx->SetTarget(nullptr);
+
     g_dcomp->GetSwapChain()->Present(1, 0);
+    if (!g_dcomp->IsFirstPresentDone()) {
+        g_dcomp->MarkFirstPresent();
+        SetTimer(g_hwnd, 3, 100, nullptr);
+    }
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"DCompTextEditor";
-    wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.hCursor = nullptr;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 
-    if (!RegisterClass(&wc)) return 1;
+    if (!RegisterClass(&wc)) { CoUninitialize(); return 1; }
 
     HWND hwnd = CreateWindowEx(
         0, wc.lpszClassName,
@@ -1183,7 +1724,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         nullptr, nullptr, hInstance, nullptr);
 
-    if (!hwnd) return 1;
+    if (!hwnd) { CoUninitialize(); return 1; }
 
     g_hwnd = hwnd;
     ShowWindow(hwnd, nCmdShow);
@@ -1193,5 +1734,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+
+    CoUninitialize();
     return (int)msg.wParam;
 }
