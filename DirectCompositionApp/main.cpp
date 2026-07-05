@@ -1067,6 +1067,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     if (item != g_dropHover) {
                         g_dropHover = item;
                     }
+                } else {
+                    g_dropHover = -1;
                 }
             }
             Invalidate();
@@ -1127,6 +1129,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_KILLFOCUS:
+        if (g_menuOpen >= 0) {
+            CloseMenu();
+            Invalidate();
+        }
         return 0;
 
     case WM_SETCURSOR: {
