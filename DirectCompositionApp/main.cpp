@@ -46,11 +46,14 @@ static float g_scrollY = 0;
 static bool g_caretVisible = true;
 static bool g_layoutDirty = true;
 static bool g_dragging = false;
+static bool g_mouseTracking = false;
 static int g_windowW = 800;
 static int g_windowH = 600;
 static float g_marginLeft = 48.0f;
 static float g_marginTop = 56.0f;
-static const float g_fontSize = 16.0f;
+static float g_fontSize = 16.0f;
+static std::wstring g_fontFamily = L"Cascadia Mono";
+static bool g_showStatusBar = true;
 static const float g_menuBarH = 24.0f;
 
 static ComPtr<IDWriteTextFormat> g_textFormat;
@@ -222,7 +225,7 @@ static void InitTabBar() {
 enum MenuAction {
     MA_NEW, MA_OPEN, MA_SAVE, MA_SAVEAS, MA_EXIT,
     MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_DELETE, MA_SELECTALL, MA_TIMEDATE,
-    MA_WORDWRAP, MA_FONT, MA_ABOUT, MA_NONE
+    MA_WORDWRAP, MA_FONT, MA_ABOUT, MA_ZOOMIN, MA_ZOOMOUT, MA_STATUSBAR, MA_NONE
 };
 
 struct MenuItem {
@@ -265,10 +268,10 @@ static MenuDef g_menus[] = {
         { L"Font...",       L"",                MA_FONT },
     }, 2, 0, 0 },
     { L"View", {
-        { L"Zoom In",        L"Ctrl+=",          MA_NONE },
-        { L"Zoom Out",       L"Ctrl+-",          MA_NONE },
+        { L"Zoom In",        L"Ctrl+=",          MA_ZOOMIN },
+        { L"Zoom Out",       L"Ctrl+-",          MA_ZOOMOUT },
         { L"", L"", MA_NONE, true },
-        { L"Status Bar",     L"",                MA_NONE },
+        { L"Status Bar",     L"",                MA_STATUSBAR },
     }, 4, 0, 0 },
     { L"Help", {
         { L"About",         L"",                MA_ABOUT },
@@ -297,6 +300,29 @@ static void EnsureCursorVisible();
 static float GetTotalDocumentHeight();
 static void RenderEditor();
 static void HandleKey(WPARAM wParam);
+
+static void RecreateTextFormat() {
+    if (!g_dcomp) return;
+    g_textFormat.Reset();
+    g_dcomp->GetDWriteFactory()->CreateTextFormat(
+        g_fontFamily.c_str(), nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, g_fontSize, L"en-us",
+        g_textFormat.GetAddressOf());
+
+    if (!g_textFormat) {
+        g_dcomp->GetDWriteFactory()->CreateTextFormat(
+            L"Consolas", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, g_fontSize, L"en-us",
+            g_textFormat.GetAddressOf());
+    }
+
+    if (g_textFormat) {
+        g_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+}
 static size_t CountNewlinesBefore(size_t pos);
 static size_t LastNewlineBefore(size_t pos);
 
@@ -658,8 +684,38 @@ static void ExecMenuAction(int action) {
     case MA_WORDWRAP:
         g_wordWrap = !g_wordWrap;
         break;
-    case MA_FONT:
+    case MA_FONT: {
+        CHOOSEFONT cf = { sizeof(cf) };
+        LOGFONT lf = { 0 };
+        wcscpy_s(lf.lfFaceName, g_fontFamily.c_str());
+        lf.lfHeight = (LONG)(-g_fontSize * GetDpiForWindow(g_hwnd) / 72.0f);
+        cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT;
+        cf.lpLogFont = &lf;
+        cf.hwndOwner = g_hwnd;
+        if (ChooseFont(&cf)) {
+            g_fontFamily = lf.lfFaceName;
+            g_fontSize = (float)cf.iPointSize / 10.0f;
+            RecreateTextFormat();
+        }
+        break;
+    }
     case MA_ABOUT:
+        MessageBox(g_hwnd, L"DirectComposition Text Editor\nVersion 1.0\n\nA custom-rendered Notepad-style editor.", L"About", MB_OK | MB_ICONINFORMATION);
+        break;
+    case MA_ZOOMIN:
+        if (g_fontSize < 72.0f) {
+            g_fontSize += 2.0f;
+            RecreateTextFormat();
+        }
+        break;
+    case MA_ZOOMOUT:
+        if (g_fontSize > 8.0f) {
+            g_fontSize -= 2.0f;
+            RecreateTextFormat();
+        }
+        break;
+    case MA_STATUSBAR:
+        g_showStatusBar = !g_showStatusBar;
         break;
     }
     g_layoutDirty = true;
@@ -698,22 +754,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             OutputDebugStringA("[Editor] Tree-sitter highlighter init failed\n");
         }
 
-        g_dcomp->GetDWriteFactory()->CreateTextFormat(
-            L"Cascadia Mono", nullptr,
-            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, g_fontSize, L"en-us",
-            g_textFormat.GetAddressOf());
-
-        if (!g_textFormat) {
-            g_dcomp->GetDWriteFactory()->CreateTextFormat(
-                L"Consolas", nullptr,
-                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL, g_fontSize, L"en-us",
-                g_textFormat.GetAddressOf());
-        }
-
-        g_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        RecreateTextFormat();
 
         g_dcomp->GetDWriteFactory()->CreateTextFormat(
             L"Segoe UI", nullptr,
@@ -1039,6 +1080,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_MOUSEMOVE: {
+        if (!g_mouseTracking) {
+            TRACKMOUSEEVENT tme = { sizeof(tme) };
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            g_mouseTracking = true;
+        }
+
         float mx = (float)GET_X_LPARAM(lParam);
         float my = (float)GET_Y_LPARAM(lParam);
 
@@ -1110,6 +1159,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_tabCloseHover = newCloseHov;
             Invalidate();
         }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE: {
+        g_mouseTracking = false;
+        g_menuHover = -1;
+        g_tabHover = -1;
+        g_tabCloseHover = -1;
+        Invalidate();
         return 0;
     }
 
@@ -1407,6 +1465,20 @@ static void HandleKey(WPARAM wParam) {
             EnsureCursorVisible();
             Invalidate();
             return;
+        case VK_OEM_PLUS:
+        case VK_ADD:
+            if (ctrl) {
+                ExecMenuAction(MA_ZOOMIN);
+                return;
+            }
+            break;
+        case VK_OEM_MINUS:
+        case VK_SUBTRACT:
+            if (ctrl) {
+                ExecMenuAction(MA_ZOOMOUT);
+                return;
+            }
+            break;
         case VK_TAB:
             if (shift) {
                 if (g_activeTab > 0) SwitchTab(g_activeTab - 1);
@@ -1587,7 +1659,8 @@ static void UpdateLayout() {
     if (!g_layoutDirty && g_textLayout) return;
     if (!g_dcomp) return;
     float maxW = (float)g_windowW - g_marginLeft * 2;
-    float maxH = (float)g_windowH - g_marginTop - 30.0f;
+    float footerH = g_showStatusBar ? 30.0f : 0.0f;
+    float maxH = (float)g_windowH - g_marginTop - footerH;
     if (maxW < 1) maxW = 1;
     if (maxH < 1) maxH = 1;
 
@@ -1758,7 +1831,8 @@ static void RenderEditor() {
     UpdateLayout();
 
     if (g_textLayout) {
-        D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, (float)g_windowW, (float)g_windowH - 30.0f);
+        float footerH = g_showStatusBar ? 30.0f : 0.0f;
+        D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, (float)g_windowW, (float)g_windowH - footerH);
         ctx->PushAxisAlignedClip(editorClip, D2D1_ANTIALIAS_MODE_ALIASED);
 
         ComPtr<ID2D1SolidColorBrush> textBrush;
@@ -1850,8 +1924,8 @@ static void RenderEditor() {
         ctx->PopAxisAlignedClip();
     }
 
-    ComPtr<ID2D1SolidColorBrush> menuBarBgBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), menuBarBgBrush.GetAddressOf());
+    ComPtr<ID2D1SolidColorBrush> chromeBgBrush;
+    ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), chromeBgBrush.GetAddressOf());
 
     ComPtr<ID2D1SolidColorBrush> statusBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.70f, 0.70f, 0.70f), statusBrush.GetAddressOf());
@@ -1863,7 +1937,7 @@ static void RenderEditor() {
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.28f), separatorBrush.GetAddressOf());
 
     float menuY = 0;
-    ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), menuBarBgBrush.Get());
+    ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), chromeBgBrush.Get());
 
     ComPtr<ID2D1SolidColorBrush> menuText;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.80f, 0.82f), menuText.GetAddressOf());
@@ -1875,12 +1949,18 @@ static void RenderEditor() {
     for (int i = 0; i < g_menuCount; i++) {
         float mx = g_menus[i].x;
         float mw = g_menus[i].w;
-        bool active = (i == g_menuOpen) || (i == g_menuHover && g_menuOpen < 0);
+        bool isOpen = (i == g_menuOpen);
+        bool isHover = (i == g_menuHover && g_menuOpen < 0);
 
-        if (active) {
+        if (isOpen) {
+            ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), chromeBgBrush.Get());
+            ctx->DrawLine(D2D1::Point2F(mx, menuY), D2D1::Point2F(mx, menuY + g_menuBarH), separatorBrush.Get(), 1.0f);
+            ctx->DrawLine(D2D1::Point2F(mx + mw, menuY), D2D1::Point2F(mx + mw, menuY + g_menuBarH), separatorBrush.Get(), 1.0f);
+        } else if (isHover) {
             ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuHighlight.Get());
         }
 
+        bool active = isOpen || isHover;
         g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
             D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH),
@@ -1891,9 +1971,7 @@ static void RenderEditor() {
         separatorBrush.Get(), 1.0f);
 
     float tabBarY = menuY + g_menuBarH;
-    ComPtr<ID2D1SolidColorBrush> tabBarBgBrush;
-    ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), tabBarBgBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, tabBarY, (float)g_windowW, tabBarY + g_tabBarH), tabBarBgBrush.Get());
+    ctx->FillRectangle(D2D1::RectF(0, tabBarY, (float)g_windowW, tabBarY + g_tabBarH), chromeBgBrush.Get());
 
     ComPtr<ID2D1SolidColorBrush> tabActiveBgBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.12f), tabActiveBgBrush.GetAddressOf());
@@ -1948,12 +2026,14 @@ static void RenderEditor() {
     ctx->DrawLine(D2D1::Point2F(0, tabBarY + g_tabBarH), D2D1::Point2F((float)g_windowW, tabBarY + g_tabBarH),
         separatorBrush.Get(), 1.0f);
 
-    float footerH = 30.0f;
-    ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - footerH, (float)g_windowW, (float)g_windowH), menuBarBgBrush.Get());
-    ctx->DrawLine(D2D1::Point2F(0, (float)g_windowH - footerH), D2D1::Point2F((float)g_windowW, (float)g_windowH - footerH),
-        separatorBrush.Get(), 1.0f);
+    float footerH = g_showStatusBar ? 30.0f : 0.0f;
+    if (g_showStatusBar) {
+        ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - footerH, (float)g_windowW, (float)g_windowH), chromeBgBrush.Get());
+        ctx->DrawLine(D2D1::Point2F(0, (float)g_windowH - footerH), D2D1::Point2F((float)g_windowW, (float)g_windowH - footerH),
+            separatorBrush.Get(), 1.0f);
+    }
 
-    if (g_statusFmt) {
+    if (g_showStatusBar && g_statusFmt) {
         wchar_t statusBuf[256];
         _snwprintf_s(statusBuf, 256,
             L"%zu chars  |  Ln %zu  Col %zu  |  %.0f fps",

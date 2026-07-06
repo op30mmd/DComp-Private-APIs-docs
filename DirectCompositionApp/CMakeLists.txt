@@ -61,6 +61,7 @@ target_link_libraries(DirectCompositionApp PRIVATE
     dwmapi
     ole32
     uuid
+    comdlg32
 )
 
 target_compile_definitions(DirectCompositionApp PRIVATE
@@ -73,4 +74,20 @@ target_compile_definitions(DirectCompositionApp PRIVATE
 
 set_target_properties(DirectCompositionApp PROPERTIES
     VS_DPI_AWARE "ON"
+)
+
+# Tests
+add_executable(highlighter_test
+    tests/highlighter_test.cpp
+    TreeSitterHighlighter.cpp
+    TreeSitterHighlighter.h
+)
+target_link_libraries(highlighter_test PRIVATE
+    tree-sitter-core
+    tree-sitter-cpp
+)
+target_compile_definitions(highlighter_test PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
 )
