@@ -1451,6 +1451,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_RBUTTONUP: {
+        if (g_dialogOpen != DIALOG_NONE) return 0;
+
         float mx = (float)GET_X_LPARAM(lParam);
         float my = (float)GET_Y_LPARAM(lParam);
 
@@ -1762,6 +1764,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     for (auto& t : g_tabs) { if (t.dirty) { anyDirty = true; break; } }
                     if (!anyDirty) {
                         DestroyWindow(hwnd);
+                    } else {
+                        PostMessage(hwnd, WM_CLOSE, 0, 0);
                     }
                 });
                 return 0;
@@ -1818,7 +1822,7 @@ static size_t CountNewlinesBefore(size_t pos) {
         return count;
     }
     auto it = std::upper_bound(g_lineStarts.begin(), g_lineStarts.end(), pos);
-    return (size_t)(it - g_lineStarts.begin()) - (it != g_lineStarts.begin() && *(it - 1) == pos ? 0 : 0);
+    return (size_t)(it - g_lineStarts.begin()) - 1;
 }
 
 static size_t LastNewlineBefore(size_t pos) {
@@ -1829,7 +1833,7 @@ static size_t LastNewlineBefore(size_t pos) {
         }
         return 0;
     }
-    auto it = std::upper_bound(g_lineStarts.begin(), g_lineStarts.end(), pos - 1);
+    auto it = std::upper_bound(g_lineStarts.begin(), g_lineStarts.end(), pos);
     if (it == g_lineStarts.begin()) return 0;
     --it;
     return *it;
