@@ -20,7 +20,7 @@ if not exist build mkdir build
 echo.
 echo Configuring CMake...
 cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -A x64
 if %errorlevel% neq 0 (
     echo ERROR: CMake configuration failed
     pause
