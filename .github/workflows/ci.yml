@@ -25,4 +25,4 @@ jobs:
 
     - name: Run Tests
       run: |
-        .\build\bin\Release\highlighter_test.exe
+        .\build\Release\highlighter_test.exe

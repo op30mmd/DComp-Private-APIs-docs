@@ -39,7 +39,7 @@ if %errorlevel% neq 0 (
 echo.
 echo ========================================
 echo  Build successful!
-echo  Output: build\bin\Release\DirectCompositionApp.exe
+echo  Output: build\Release\DirectCompositionApp.exe
 echo ========================================
 
 pause
