@@ -142,6 +142,7 @@ static TabInfo& ActiveTab() { return g_tabs[g_activeTab]; }
 static float GetTotalDocumentHeight();
 static void Invalidate();
 static void EnsureCursorVisible();
+static void ResetCaretBlink();
 static void SwitchTab(int idx);
 static void DoSave();
 static void ShowAboutDialog();
@@ -373,6 +374,25 @@ static int g_ctxHover = -1;
 static float g_ctxX = 0;
 static float g_ctxY = 0;
 
+static float g_menuBarHoverAlpha = 0.0f;
+static int   g_menuBarHoverIdx   = -1;
+static float g_dropHoverAlpha = 0.0f;
+static int   g_dropHoverIdx   = -1;
+static float g_ctxHoverAlpha = 0.0f;
+static int   g_ctxHoverIdx   = -1;
+static float g_tabHoverAlpha = 0.0f;
+static int   g_tabHoverIdx   = -1;
+
+static float g_menuSwitchFromX = 0.0f;
+static float g_menuSwitchFromW = 0.0f;
+static float g_menuSwitchToX = 0.0f;
+static float g_menuSwitchToW = 0.0f;
+static float g_menuSwitchProgress = 1.0f;
+static int   g_menuSwitchPrevOpen = -1;
+
+static float g_dialogBtnHoverAlpha = 0.0f;
+static int   g_dialogBtnHoverIdx   = -1;
+
 static ComPtr<IDWriteTextFormat> g_menuFmt;
 
 static HCURSOR g_lastCursor = nullptr;
@@ -437,6 +457,58 @@ static void UpdateAnimations() {
             if (1.0f - g_dialogScale < 0.005f) g_dialogScale = 1.0f;
             stillAnimating = true;
         }
+    }
+
+    // Menu switch slide animation
+    if (g_menuSwitchProgress < 1.0f) {
+        g_menuSwitchProgress += 0.18f;
+        if (g_menuSwitchProgress > 1.0f) g_menuSwitchProgress = 1.0f;
+        stillAnimating = true;
+    }
+
+    // Dialog button hover animation
+    {
+        float target = (g_dialogHoverBtn >= 0) ? 1.0f : 0.0f;
+        if (g_dialogHoverBtn != g_dialogBtnHoverIdx) { g_dialogBtnHoverAlpha = 0.0f; g_dialogBtnHoverIdx = g_dialogHoverBtn; }
+        g_dialogBtnHoverAlpha += (target - g_dialogBtnHoverAlpha) * 0.3f;
+        if (fabsf(g_dialogBtnHoverAlpha - target) < 0.01f) g_dialogBtnHoverAlpha = target;
+        else stillAnimating = true;
+    }
+
+    // Menu hover animation
+    {
+        float target = (g_menuHover >= 0 && g_menuOpen < 0) ? 1.0f : 0.0f;
+        if (g_menuHover != g_menuBarHoverIdx) { g_menuBarHoverAlpha = 0.0f; g_menuBarHoverIdx = g_menuHover; }
+        g_menuBarHoverAlpha += (target - g_menuBarHoverAlpha) * 0.25f;
+        if (fabsf(g_menuBarHoverAlpha - target) < 0.01f) g_menuBarHoverAlpha = target;
+        else stillAnimating = true;
+    }
+
+    // Tab hover animation
+    {
+        float target = (g_tabHover >= 0) ? 1.0f : 0.0f;
+        if (g_tabHover != g_tabHoverIdx) { g_tabHoverAlpha = 0.0f; g_tabHoverIdx = g_tabHover; }
+        g_tabHoverAlpha += (target - g_tabHoverAlpha) * 0.25f;
+        if (fabsf(g_tabHoverAlpha - target) < 0.01f) g_tabHoverAlpha = target;
+        else stillAnimating = true;
+    }
+
+    // Dropdown hover animation
+    {
+        float target = (g_dropHover >= 0) ? 1.0f : 0.0f;
+        if (g_dropHover != g_dropHoverIdx) { g_dropHoverAlpha = 0.0f; g_dropHoverIdx = g_dropHover; }
+        g_dropHoverAlpha += (target - g_dropHoverAlpha) * 0.25f;
+        if (fabsf(g_dropHoverAlpha - target) < 0.01f) g_dropHoverAlpha = target;
+        else stillAnimating = true;
+    }
+
+    // Context menu hover animation
+    {
+        float target = (g_ctxHover >= 0) ? 1.0f : 0.0f;
+        if (g_ctxHover != g_ctxHoverIdx) { g_ctxHoverAlpha = 0.0f; g_ctxHoverIdx = g_ctxHover; }
+        g_ctxHoverAlpha += (target - g_ctxHoverAlpha) * 0.25f;
+        if (fabsf(g_ctxHoverAlpha - target) < 0.01f) g_ctxHoverAlpha = target;
+        else stillAnimating = true;
     }
 
     if (stillAnimating != g_animating) {
@@ -625,17 +697,17 @@ static void RenderDialog(ID2D1DeviceContext* ctx) {
     float dx = cx - dw / 2.0f;
     float dy = cy - dh / 2.0f;
 
-    D2D1_MATRIX_3X2_F scale = D2D1::Matrix3x2F::Scale(g_dialogScale, g_dialogScale, D2D1::Point2F(cx, cy));
-
     ctx->PushAxisAlignedClip(D2D1::RectF(0, 0, (float)g_windowW, (float)g_windowH), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     D2D1_MATRIX_3X2_F oldTransform;
     ctx->GetTransform(&oldTransform);
-    ctx->SetTransform(scale);
 
     ComPtr<ID2D1SolidColorBrush> backdropBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.5f * alpha), backdropBrush.GetAddressOf());
     ctx->FillRectangle(D2D1::RectF(0, 0, (float)g_windowW, (float)g_windowH), backdropBrush.Get());
+
+    D2D1_MATRIX_3X2_F scale = D2D1::Matrix3x2F::Scale(g_dialogScale, g_dialogScale, D2D1::Point2F(cx, cy));
+    ctx->SetTransform(scale);
 
     ComPtr<ID2D1SolidColorBrush> dlgBgBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.14f, 0.14f, 0.16f, alpha), dlgBgBrush.GetAddressOf());
@@ -677,9 +749,14 @@ static void RenderDialog(ID2D1DeviceContext* ctx) {
     float btnX = dx + (dw - totalBtnW) / 2.0f;
 
     for (int i = 0; i < (int)g_dialogBtns.size(); i++) {
-        bool hovered = (i == g_dialogHoverBtn);
+        float hAlpha = (i == g_dialogHoverBtn) ? g_dialogBtnHoverAlpha : 0.0f;
         D2D1_ROUNDED_RECT btnRect = D2D1::RoundedRect(D2D1::RectF(btnX, btnY, btnX + 80.0f, btnY + btnH), 4, 4);
-        ctx->FillRoundedRectangle(btnRect, hovered ? dlgBtnBgHover.Get() : dlgBtnBg.Get());
+        dlgBtnBg->SetOpacity(alpha * (1.0f - hAlpha));
+        ctx->FillRoundedRectangle(btnRect, dlgBtnBg.Get());
+        dlgBtnBgHover->SetOpacity(alpha * hAlpha);
+        ctx->FillRoundedRectangle(btnRect, dlgBtnBgHover.Get());
+        dlgBtnBg->SetOpacity(alpha);
+        dlgBtnBgHover->SetOpacity(alpha);
         ctx->DrawRoundedRectangle(btnRect, dlgBtnBorder.Get(), 1.0f);
 
         if (g_dialogBtnFmt) {
@@ -1376,6 +1453,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     MenuDef& m = g_menus[g_menuOpen];
                     ExecMenuAction(m.items[item].action);
                     CloseMenu();
+                } else {
+                    CloseMenu();
                 }
             }
             Invalidate();
@@ -1538,6 +1617,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             int menu = HitTestMenuBar(mx, my);
             if (menu >= 0) {
                 if (menu != g_menuOpen) {
+                    if (g_menuSwitchProgress >= 1.0f && g_menuOpen >= 0) {
+                        g_menuSwitchFromX = g_menus[g_menuOpen].x;
+                        g_menuSwitchFromW = g_menus[g_menuOpen].w;
+                    } else {
+                        float t = g_menuSwitchProgress;
+                        g_menuSwitchFromX = g_menuSwitchFromX + (g_menuSwitchToX - g_menuSwitchFromX) * t;
+                        g_menuSwitchFromW = g_menuSwitchFromW + (g_menuSwitchToW - g_menuSwitchFromW) * t;
+                    }
+                    g_menuSwitchToX = g_menus[menu].x;
+                    g_menuSwitchToW = g_menus[menu].w;
+                    g_menuSwitchProgress = 0.0f;
                     g_menuOpen = menu;
                     g_dropHover = -1;
                 }
@@ -1558,8 +1648,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        if (g_dragging && g_textLayout && mx >= g_marginLeft) {
+        if (g_dragging && g_textLayout) {
             float textX = mx - g_marginLeft;
+            if (textX < 0) textX = 0;
+
             float textY = my - g_marginTop + g_scrollY;
             BOOL isTrailing, isInside;
             UINT32 pos = 0;
@@ -1570,7 +1662,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             g_selEnd = pos;
             g_cursorPos = pos;
-            g_caretVisible = true;
+
+            float footerH = g_showStatusBar ? 30.0f : 0.0f;
+            float scrollSpeed = 5.0f;
+            if (my < g_marginTop) {
+                float newScroll = g_scrollY - scrollSpeed;
+                if (newScroll < 0) newScroll = 0;
+                if (g_dmanip) g_dmanip->ScrollTo(newScroll, FALSE);
+                else { g_scrollY = newScroll; Invalidate(); }
+            } else if (my > (float)g_windowH - footerH) {
+                float newScroll = g_scrollY + scrollSpeed;
+                float totalH = GetTotalDocumentHeight();
+                float visibleH = (float)g_windowH - g_marginTop - footerH;
+                if (totalH > 0 && newScroll > totalH - visibleH) newScroll = totalH - visibleH;
+                if (g_dmanip) g_dmanip->ScrollTo(newScroll, FALSE);
+                else { g_scrollY = newScroll; Invalidate(); }
+            }
+
+            ResetCaretBlink();
             Invalidate();
             return 0;
         }
@@ -1634,6 +1743,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_SETCURSOR: {
+        if (g_dragging) {
+            HCURSOR loaded = LoadCursor(nullptr, IDC_IBEAM);
+            if (loaded != g_lastCursor) {
+                g_lastCursor = loaded;
+                SetCursor(loaded);
+            }
+            return 1;
+        }
+
         if (LOWORD(lParam) != HTCLIENT) {
             g_lastCursor = nullptr;
             return DefWindowProcW(hwnd, WM_SETCURSOR, wParam, lParam);
@@ -1645,24 +1763,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         LPCWSTR cursorId = IDC_IBEAM;
 
-        if (g_dragging) {
-            cursorId = IDC_IBEAM;
+        if (g_dialogOpen != DIALOG_NONE) {
+            bool overBtn = HitTestDialogButtons((float)pt.x, (float)pt.y);
+            cursorId = overBtn ? IDC_HAND : IDC_ARROW;
+        } else if (g_tabDragging) {
+            cursorId = IDC_ARROW;
+        } else if (g_menuOpen >= 0) {
+            bool overDropdown = (HitTestDropdown((float)pt.x, (float)pt.y) >= 0);
+            bool overMenuBar = (pt.y >= 0 && pt.y < g_menuBarH);
+            cursorId = (overDropdown || overMenuBar) ? IDC_HAND : IDC_ARROW;
         } else if (g_ctxOpen) {
             int item = HitTestCtxMenu((float)pt.x, (float)pt.y);
             cursorId = item >= 0 ? IDC_HAND : IDC_ARROW;
         } else {
-            bool overDropdown = false;
-            if (g_menuOpen >= 0) {
-                int item = HitTestDropdown((float)pt.x, (float)pt.y);
-                overDropdown = (item >= 0);
-            }
-
             bool inMenuBar = (pt.y >= 0 && pt.y < g_menuBarH);
             bool inTabBar = (pt.y >= g_menuBarH && pt.y < g_menuBarH + g_tabBarH);
             bool inHintBar = (pt.y >= g_windowH - 30);
             bool inGutter = (pt.x < g_marginLeft);
 
-            if (inMenuBar || overDropdown) {
+            if (inMenuBar) {
                 cursorId = IDC_HAND;
             } else if (inTabBar) {
                 int tabIdx = HitTestTabBar((float)pt.x, (float)pt.y);
@@ -2261,22 +2380,23 @@ static void UpdateLayout() {
 }
 
 static float GetTotalDocumentHeight() {
-    float totalH = 0;
-    if (g_textLayout) {
-        UINT32 lc = 0;
-        g_textLayout->GetLineMetrics(nullptr, 0, &lc);
-        if (lc > 0) {
-            std::vector<DWRITE_LINE_METRICS> lm(lc);
-            g_textLayout->GetLineMetrics(lm.data(), lc, &lc);
-            for (UINT32 i = 0; i < lc; i++) {
-                totalH += lm[i].height;
-            }
-        }
+    if (!g_textLayout) return 0.0f;
+    DWRITE_TEXT_METRICS metrics;
+    if (SUCCEEDED(g_textLayout->GetMetrics(&metrics))) {
+        return metrics.height;
     }
-    return totalH;
+    return 0.0f;
+}
+
+static void ResetCaretBlink() {
+    g_caretVisible = true;
+    if (g_hwnd) {
+        SetTimer(g_hwnd, 1, 500, nullptr);
+    }
 }
 
 static void EnsureCursorVisible() {
+    ResetCaretBlink();
     UpdateCursorCache();
     UpdateLayout();
     if (!g_textLayout) return;
@@ -2328,6 +2448,8 @@ static void RenderEditor() {
     auto ctx = g_dcomp->GetD2DContext();
     ctx->SetTarget(targetBitmap.Get());
     ctx->BeginDraw();
+
+    ctx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
     UpdateGutterWidth();
 
@@ -2452,26 +2574,33 @@ static void RenderEditor() {
     ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f), menuTextActive.GetAddressOf());
     ComPtr<ID2D1SolidColorBrush> menuHighlight;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), menuHighlight.GetAddressOf());
-
     for (int i = 0; i < g_menuCount; i++) {
         float mx = g_menus[i].x;
         float mw = g_menus[i].w;
         bool isOpen = (i == g_menuOpen);
-        bool isHover = (i == g_menuHover && g_menuOpen < 0);
+        bool isHovered = (i == g_menuHover && g_menuOpen < 0);
 
-        if (isOpen) {
-            ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), chromeBgBrush.Get());
-            ctx->DrawLine(D2D1::Point2F(mx, menuY), D2D1::Point2F(mx, menuY + g_menuBarH), separatorBrush.Get(), 1.0f);
-            ctx->DrawLine(D2D1::Point2F(mx + mw, menuY), D2D1::Point2F(mx + mw, menuY + g_menuBarH), separatorBrush.Get(), 1.0f);
-        } else if (isHover) {
+        if (!isOpen && isHovered && g_menuBarHoverAlpha > 0.01f) {
+            menuHighlight->SetOpacity(g_menuBarHoverAlpha);
             ctx->FillRectangle(D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuHighlight.Get());
+            menuHighlight->SetOpacity(1.0f);
         }
 
-        bool active = isOpen || isHover;
+        float tAlpha = isHovered ? g_menuBarHoverAlpha : 0.0f;
+        if (isOpen) tAlpha = 1.0f;
         g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
-            D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH),
-            active ? menuTextActive.Get() : menuText.Get());
+        if (tAlpha < 1.0f) {
+            menuText->SetOpacity(1.0f - tAlpha);
+            ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
+                D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuText.Get());
+            menuText->SetOpacity(1.0f);
+        }
+        if (tAlpha > 0.0f) {
+            menuTextActive->SetOpacity(tAlpha);
+            ctx->DrawText(g_menus[i].label, (UINT32)wcslen(g_menus[i].label), g_menuFmt.Get(),
+                D2D1::RectF(mx, menuY, mx + mw, menuY + g_menuBarH), menuTextActive.Get());
+            menuTextActive->SetOpacity(1.0f);
+        }
     }
 
     ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F((float)g_windowW, menuY + g_menuBarH),
@@ -2501,8 +2630,10 @@ static void RenderEditor() {
 
         if (active) {
             ctx->FillRectangle(D2D1::RectF(tabX, tabBarY, tabX + w, tabBarY + g_tabBarH), tabActiveBgBrush.Get());
-        } else if (hover) {
+        } else if (hover && g_tabHoverAlpha > 0.01f) {
+            tabHoverBgBrush->SetOpacity(g_tabHoverAlpha);
             ctx->FillRectangle(D2D1::RectF(tabX, tabBarY, tabX + w, tabBarY + g_tabBarH), tabHoverBgBrush.Get());
+            tabHoverBgBrush->SetOpacity(1.0f);
         }
 
         ctx->DrawLine(D2D1::Point2F(tabX + w, tabBarY + 4), D2D1::Point2F(tabX + w, tabBarY + g_tabBarH - 4),
@@ -2511,15 +2642,20 @@ static void RenderEditor() {
         if (g_tabFmt) {
             wchar_t tabLabel[256];
             _snwprintf_s(tabLabel, 256, L"%s%s", t.displayName.c_str(), t.dirty ? L" *" : L"");
+            float textAlpha = active ? 1.0f : (hover ? 0.5f + g_tabHoverAlpha * 0.5f : 0.5f);
+            tabTextBrush->SetOpacity(textAlpha);
             ctx->DrawText(tabLabel, (UINT32)wcslen(tabLabel), g_tabFmt.Get(),
                 D2D1::RectF(tabX + g_tabPadX, tabBarY, tabX + w - (g_tabs.size() > 1 ? 20.0f : 0), tabBarY + g_tabBarH),
                 active ? tabTextActiveBrush.Get() : tabTextBrush.Get());
+            tabTextBrush->SetOpacity(1.0f);
         }
 
         if (g_tabs.size() > 1) {
             float closeX = tabX + w - 18.0f;
             float closeY = tabBarY + (g_tabBarH - g_tabCloseSize) / 2.0f;
             bool closeHov = (i == g_tabCloseHover);
+            float closeAlpha = closeHov ? 0.8f + 0.2f * g_tabHoverAlpha : 0.52f;
+            tabCloseBrush->SetOpacity(closeAlpha);
             auto* closeBrushPtr = closeHov ? tabCloseHoverBrush.Get() : tabCloseBrush.Get();
             ctx->DrawLine(D2D1::Point2F(closeX, closeY), D2D1::Point2F(closeX + g_tabCloseSize, closeY + g_tabCloseSize),
                 closeBrushPtr, 1.2f);
@@ -2594,7 +2730,13 @@ static void RenderEditor() {
 
         MenuDef& m = g_menus[g_menuOpen];
         float dropW = 240.0f;
-        float dropX = m.x;
+        float dropX;
+        if (g_menuSwitchProgress < 1.0f) {
+            float t = g_menuSwitchProgress * g_menuSwitchProgress * (3.0f - 2.0f * g_menuSwitchProgress);
+            dropX = g_menuSwitchFromX + (m.x - g_menuSwitchFromX) * t;
+        } else {
+            dropX = m.x;
+        }
         float dropY = menuY + g_menuBarH;
 
         float totalH = 0;
@@ -2614,16 +2756,29 @@ static void RenderEditor() {
             } else {
                 float ih = 24.0f;
                 bool hovered = (i == g_dropHover);
+                float hAlpha = hovered ? g_dropHoverAlpha : 0.0f;
 
-                if (hovered) {
+                if (hAlpha > 0.01f) {
+                    dropHighlight->SetOpacity(g_menuOpacity * hAlpha);
                     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(dropX + 2, iy + 1, dropX + dropW - 2, iy + ih - 1), 2, 2);
                     ctx->FillRoundedRectangle(rr, dropHighlight.Get());
+                    dropHighlight->SetOpacity(g_menuOpacity);
                 }
 
                 g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
-                    D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih),
-                    hovered ? menuTextActive.Get() : dropText.Get());
+                if (hovered) {
+                    menuTextActive->SetOpacity(g_menuOpacity * hAlpha);
+                    dropText->SetOpacity(g_menuOpacity * (1.0f - hAlpha));
+                    ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                        D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih), menuTextActive.Get());
+                    ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                        D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih), dropText.Get());
+                    menuTextActive->SetOpacity(g_menuOpacity);
+                    dropText->SetOpacity(g_menuOpacity);
+                } else {
+                    ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                        D2D1::RectF(dropX + 12, iy, dropX + dropW - 80, iy + ih), dropText.Get());
+                }
 
                 if (item.shortcut[0]) {
                     ComPtr<IDWriteTextFormat> scFmt;
@@ -2680,19 +2835,37 @@ static void RenderEditor() {
             } else {
                 float ih = 24.0f;
                 bool hovered = (i == g_ctxHover);
+                float hAlpha = hovered ? g_ctxHoverAlpha : 0.0f;
                 bool enabled = true;
                 if (item.action == MA_CUT || item.action == MA_COPY)
                     enabled = hasSel;
 
-                if (hovered) {
+                if (hAlpha > 0.01f) {
+                    ctxHighlight->SetOpacity(hAlpha);
                     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(g_ctxX + 2, iy + 1, g_ctxX + dw - 2, iy + ih - 1), 2, 2);
                     ctx->FillRoundedRectangle(rr, ctxHighlight.Get());
+                    ctxHighlight->SetOpacity(1.0f);
                 }
 
                 g_menuFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
-                    D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih),
-                    enabled ? (hovered ? menuTextActive.Get() : ctxText.Get()) : ctxTextDim.Get());
+                if (enabled) {
+                    if (hovered) {
+                        menuTextActive->SetOpacity(hAlpha);
+                        ctxText->SetOpacity(1.0f - hAlpha);
+                        ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                            D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih), menuTextActive.Get());
+                        ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                            D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih), ctxText.Get());
+                        menuTextActive->SetOpacity(1.0f);
+                        ctxText->SetOpacity(1.0f);
+                    } else {
+                        ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                            D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih), ctxText.Get());
+                    }
+                } else {
+                    ctx->DrawText(item.label, (UINT32)wcslen(item.label), g_menuFmt.Get(),
+                        D2D1::RectF(g_ctxX + 12, iy, g_ctxX + dw - 8, iy + ih), ctxTextDim.Get());
+                }
                 iy += ih;
             }
         }
