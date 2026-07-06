@@ -47,6 +47,9 @@ static bool g_caretVisible = true;
 static bool g_layoutDirty = true;
 static bool g_dragging = false;
 static bool g_mouseTracking = false;
+static float g_caretAnimX = -1.0f, g_caretAnimY = -1.0f;
+static float g_menuOpacity = 0.0f;
+static bool g_animating = false;
 static int g_windowW = 800;
 static int g_windowH = 600;
 static float g_marginLeft = 48.0f;
@@ -301,6 +304,56 @@ static float GetTotalDocumentHeight();
 static void RenderEditor();
 static void HandleKey(WPARAM wParam);
 
+static void UpdateAnimations() {
+    bool stillAnimating = false;
+
+    // Caret position animation
+    if (g_textLayout) {
+        FLOAT targetX, targetY;
+        DWRITE_HIT_TEST_METRICS hit;
+        if (SUCCEEDED(g_textLayout->HitTestTextPosition((UINT32)g_cursorPos, FALSE, &targetX, &targetY, &hit))) {
+            float tx = g_marginLeft + targetX;
+            float ty = g_marginTop + targetY; // Relative to document top
+
+            if (g_caretAnimX < 0) {
+                g_caretAnimX = tx;
+                g_caretAnimY = ty;
+            } else {
+                float dx = tx - g_caretAnimX;
+                float dy = ty - g_caretAnimY;
+                if (fabsf(dx) > 0.1f || fabsf(dy) > 0.1f) {
+                    g_caretAnimX += dx * 0.4f;
+                    g_caretAnimY += dy * 0.4f;
+                    stillAnimating = true;
+                } else {
+                    g_caretAnimX = tx;
+                    g_caretAnimY = ty;
+                }
+            }
+        }
+    }
+
+    // Menu fade animation
+    if (g_menuOpen >= 0) {
+        if (g_menuOpacity < 1.0f) {
+            g_menuOpacity += 0.12f;
+            if (g_menuOpacity > 1.0f) g_menuOpacity = 1.0f;
+            stillAnimating = true;
+        }
+    } else {
+        g_menuOpacity = 0.0f;
+    }
+
+    if (stillAnimating != g_animating) {
+        g_animating = stillAnimating;
+        HMODULE hDComp = GetModuleHandleW(L"dcomp.dll");
+        if (hDComp) {
+            auto pBoost = (HRESULT(WINAPI*)(BOOL))GetProcAddress(hDComp, "DCompositionBoostCompositorClock");
+            if (pBoost) pBoost(g_animating);
+        }
+    }
+}
+
 static void RecreateTextFormat() {
     if (!g_dcomp) return;
     g_textFormat.Reset();
@@ -430,6 +483,7 @@ static void CloseMenu() {
     g_menuOpen = -1;
     g_dropHover = -1;
     g_menuTracking = false;
+    g_menuOpacity = 0.0f;
 }
 
 struct CtxMenuItem { const wchar_t* label; int action; bool separator; };
@@ -830,9 +884,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_scrollY = g_dmanip->GetScrollY();
         }
         g_dcomp->UpdateFrameStatistics();
+        UpdateAnimations();
         RenderEditor();
 
-        if (g_dmanip && g_dmanip->IsAnimating()) {
+        if ((g_dmanip && g_dmanip->IsAnimating()) || g_animating) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -1870,14 +1925,16 @@ static void RenderEditor() {
         ctx->DrawTextLayout(origin, g_textLayout.Get(), textBrush.Get());
 
         if (g_caretVisible) {
-            FLOAT cpx, cpy;
+            float cx = g_caretAnimX;
+            float cy = g_caretAnimY - g_scrollY;
+
+            // Re-fetch height for current position
+            FLOAT dummyX, dummyY;
             DWRITE_HIT_TEST_METRICS hit;
-            if (SUCCEEDED(g_textLayout->HitTestTextPosition((UINT32)g_cursorPos, FALSE, &cpx, &cpy, &hit))) {
-                float cx = g_marginLeft + cpx;
-                float cy = g_marginTop + cpy - g_scrollY;
-                float ch = hit.height > 0 ? hit.height : g_fontSize * 1.15f;
-                ctx->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(cx, cy + ch), caretBrush.Get(), 2.0f);
-            }
+            g_textLayout->HitTestTextPosition((UINT32)g_cursorPos, FALSE, &dummyX, &dummyY, &hit);
+            float ch = hit.height > 0 ? hit.height : g_fontSize * 1.15f;
+
+            ctx->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(cx, cy + ch), caretBrush.Get(), 2.0f);
         }
 
         ComPtr<ID2D1SolidColorBrush> lineNoBrush;
@@ -2059,17 +2116,17 @@ static void RenderEditor() {
 
     if (g_menuOpen >= 0) {
         ComPtr<ID2D1SolidColorBrush> dropBg;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f), dropBg.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f, g_menuOpacity), dropBg.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropHighlight;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), dropHighlight.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f, g_menuOpacity), dropHighlight.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropText;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f), dropText.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f, g_menuOpacity), dropText.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropShortcut;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), dropShortcut.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f, g_menuOpacity), dropShortcut.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropSep;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f), dropSep.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f, g_menuOpacity), dropSep.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropBorder;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f), dropBorder.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f, g_menuOpacity), dropBorder.GetAddressOf());
 
         MenuDef& m = g_menus[g_menuOpen];
         float dropW = 240.0f;
