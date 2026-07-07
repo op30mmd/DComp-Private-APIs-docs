@@ -51,3 +51,10 @@ std::wstring PresentationFactoryDemo::GetStatusString() const {
     
     return ss.str();
 }
+
+PresentationFactoryDemo::~PresentationFactoryDemo() {
+    if (m_presentationFactory) {
+        m_presentationFactory->Release();
+        m_presentationFactory = nullptr;
+    }
+}

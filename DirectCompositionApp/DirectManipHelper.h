@@ -12,6 +12,7 @@ public:
     ~DirectManipHelper();
 
     bool Initialize(HWND hwnd);
+    void CleanUp();
     void SetViewportSize(float w, float h);
     void SetContentHeight(float h);
     void ScrollTo(float scrollY, BOOL animate);

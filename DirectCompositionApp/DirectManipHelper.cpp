@@ -3,13 +3,22 @@
 DirectManipHelper::DirectManipHelper() {}
 
 DirectManipHelper::~DirectManipHelper() {
+    CleanUp();
+}
+
+void DirectManipHelper::CleanUp() {
     if (m_viewport) {
         m_viewport->Stop();
         m_viewport->Abandon();
         if (m_eventCookie) {
             m_viewport->RemoveEventHandler(m_eventCookie);
+            m_eventCookie = 0;
         }
+        m_viewport.Reset();
     }
+    m_content.Reset();
+    m_manager.Reset();
+    m_updateManager.Reset();
 }
 
 ULONG STDMETHODCALLTYPE DirectManipHelper::AddRef() {
