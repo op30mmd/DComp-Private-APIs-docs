@@ -129,6 +129,7 @@ bool TreeSitterHighlighter::Initialize() {
 }
 
 void TreeSitterHighlighter::UpdateSource(const char* source, uint32_t length) {
+    if (!m_parser) return;
     if (m_tree) {
         ts_tree_delete(m_tree);
         m_tree = nullptr;

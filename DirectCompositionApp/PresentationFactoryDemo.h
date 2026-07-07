@@ -18,7 +18,7 @@ typedef HRESULT (WINAPI *CreatePresentationFactory_t)(
 class PresentationFactoryDemo {
 public:
     PresentationFactoryDemo() = default;
-    ~PresentationFactoryDemo() = default;
+    ~PresentationFactoryDemo();
 
     bool Initialize(IUnknown* punkDevice);
     bool QueryPresentationFactory();

@@ -583,27 +583,42 @@ static void RebuildHighlightCache() {
     g_highlighter.UpdateSource(g_cachedUtf8.c_str(), (uint32_t)g_cachedUtf8.size());
 
     g_cachedUtf8ToUtf16.clear();
-    g_cachedUtf8ToUtf16.reserve(g_cachedUtf8.size() + 1);
+    g_cachedUtf8ToUtf16.resize(g_cachedUtf8.size() + 1, 0);
+
     uint32_t utf16Idx = 0;
-    for (size_t i = 0; i < g_text.length(); i++) {
-        wchar_t wc = g_text[i];
-        int bytes = 0;
-        if (wc < 0x80) {
-            bytes = 1;
-        } else if (wc < 0x800) {
-            bytes = 2;
-        } else if (wc >= 0xD800 && wc <= 0xDBFF) {
-            bytes = 4;
-            i++;
+    for (size_t i = 0; i < g_cachedUtf8.size(); ) {
+        unsigned char c = (unsigned char)g_cachedUtf8[i];
+        size_t len = 1;
+        uint32_t utf16Len = 1;
+
+        if (c < 0x80) {
+            len = 1;
+            utf16Len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            utf16Len = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            utf16Len = 1;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            utf16Len = 2;
         } else {
-            bytes = 3;
+            len = 1;
+            utf16Len = 1;
         }
-        for (int b = 0; b < bytes; b++) {
-            g_cachedUtf8ToUtf16.push_back(utf16Idx);
+
+        if (i + len > g_cachedUtf8.size()) {
+            len = g_cachedUtf8.size() - i;
         }
-        utf16Idx += (bytes == 4) ? 2 : 1;
+
+        for (size_t b = 0; b < len; b++) {
+            g_cachedUtf8ToUtf16[i + b] = utf16Idx;
+        }
+        utf16Idx += utf16Len;
+        i += len;
     }
-    g_cachedUtf8ToUtf16.push_back(utf16Idx);
+    g_cachedUtf8ToUtf16[g_cachedUtf8.size()] = utf16Idx;
 }
 
 static bool HitTestTabNewButton(float mx, float my) {
@@ -893,7 +908,30 @@ static void PushUndo(size_t pos, const std::wstring& del, const std::wstring& in
 }
 
 static void DoNew() {
-    if (!g_text.empty()) PushUndo(0, g_text, L"");
+    if (ActiveTab().dirty) {
+        ShowSavePromptDialog(g_activeTab, [](int result) {
+            if (result == 3) return;
+            if (result == 1) {
+                DoSave();
+                if (ActiveTab().dirty) return;
+            }
+            g_text.clear();
+            g_cursorPos = g_selStart = g_selEnd = 0;
+            g_scrollY = 0;
+            g_filePath.clear();
+            ActiveTab().displayName = L"Untitled";
+            ActiveTab().filePath.clear();
+            ActiveTab().dirty = false;
+            g_layoutDirty = true;
+            g_contentDirty = true;
+            g_undoStack.clear();
+            g_redoStack.clear();
+            EnsureCursorVisible();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+        });
+        return;
+    }
+
     g_text.clear();
     g_cursorPos = g_selStart = g_selEnd = 0;
     g_scrollY = 0;
@@ -903,6 +941,8 @@ static void DoNew() {
     ActiveTab().dirty = false;
     g_layoutDirty = true;
     g_contentDirty = true;
+    g_undoStack.clear();
+    g_redoStack.clear();
 }
 
 static void DoUndo() {
@@ -927,7 +967,7 @@ static void DoRedo() {
     g_undoStack.push_back(std::move(a));
 }
 
-static void DoOpen() {
+static void DoOpenInternal() {
     wchar_t file[MAX_PATH] = {};
     if (!g_filePath.empty()) wcscpy_s(file, g_filePath.c_str());
     OPENFILENAMEW of = {};
@@ -973,7 +1013,24 @@ static void DoOpen() {
         ActiveTab().dirty = false;
         g_layoutDirty = true;
         g_contentDirty = true;
+        EnsureCursorVisible();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
     }
+}
+
+static void DoOpen() {
+    if (ActiveTab().dirty) {
+        ShowSavePromptDialog(g_activeTab, [](int result) {
+            if (result == 3) return;
+            if (result == 1) {
+                DoSave();
+                if (ActiveTab().dirty) return;
+            }
+            DoOpenInternal();
+        });
+        return;
+    }
+    DoOpenInternal();
 }
 
 static void DoSave() {
@@ -987,8 +1044,8 @@ static void DoSave() {
     of.nMaxFile = MAX_PATH;
     of.lpstrDefExt = L"txt";
     of.Flags = OFN_OVERWRITEPROMPT;
-    if (GetSaveFileNameW(&of)) {
-        HANDLE hFile = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (g_filePath.empty() ? GetSaveFileNameW(&of) : TRUE) {
+        HANDLE hFile = CreateFileW(g_filePath.empty() ? file : g_filePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         if (hFile != INVALID_HANDLE_VALUE) {
             int len = WideCharToMultiByte(CP_UTF8, 0, g_text.c_str(), (int)g_text.length(), nullptr, 0, nullptr, nullptr);
             std::vector<char> buf(len);
@@ -996,10 +1053,12 @@ static void DoSave() {
             DWORD written;
             WriteFile(hFile, buf.data(), len, &written, nullptr);
             CloseHandle(hFile);
-            g_filePath = file;
-            auto pos = g_filePath.find_last_of(L"\\/");
-            ActiveTab().displayName = (pos != std::wstring::npos) ? g_filePath.substr(pos + 1) : g_filePath;
-            ActiveTab().filePath = g_filePath;
+            if (g_filePath.empty()) {
+                g_filePath = file;
+                auto pos = g_filePath.find_last_of(L"\\/");
+                ActiveTab().displayName = (pos != std::wstring::npos) ? g_filePath.substr(pos + 1) : g_filePath;
+                ActiveTab().filePath = g_filePath;
+            }
             ActiveTab().dirty = false;
             g_layoutDirty = true;
             g_contentDirty = true;
@@ -1385,11 +1444,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (wParam >= 32) {
+            std::wstring ins(1, (wchar_t)wParam);
             if (g_selStart != g_selEnd) {
                 size_t a = (std::min)(g_selStart, g_selEnd);
                 size_t b = (std::max)(g_selStart, g_selEnd);
+                PushUndo(a, g_text.substr(a, b - a), ins);
                 g_text.erase(a, b - a);
                 g_cursorPos = a;
+            } else {
+                PushUndo(g_cursorPos, L"", ins);
             }
             g_text.insert(g_cursorPos, 1, (wchar_t)wParam);
             g_cursorPos++;
@@ -1897,7 +1960,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         g_dcomp.reset();
-        g_dmanip.Reset();
+        if (g_dmanip) {
+            g_dmanip->CleanUp();
+            g_dmanip.Reset();
+        }
         PostQuitMessage(0);
         return 0;
 
@@ -2000,6 +2066,7 @@ static void HandleKey(WPARAM wParam) {
                     CloseClipboard();
                 }
                 if (wParam == 'X') {
+                    PushUndo(a, clip, L"");
                     g_text.erase(a, b - a);
                     g_cursorPos = a;
                     g_selStart = g_selEnd = g_cursorPos;
@@ -2016,14 +2083,18 @@ static void HandleKey(WPARAM wParam) {
             if (hData) {
                 const wchar_t* p = (const wchar_t*)GlobalLock(hData);
                 if (p) {
+                    std::wstring ins(p);
                     if (g_selStart != g_selEnd) {
                         size_t a = (std::min)(g_selStart, g_selEnd);
                         size_t b = (std::max)(g_selStart, g_selEnd);
+                        PushUndo(a, g_text.substr(a, b - a), ins);
                         g_text.erase(a, b - a);
                         g_cursorPos = a;
+                    } else {
+                        PushUndo(g_cursorPos, L"", ins);
                     }
-                    g_text.insert(g_cursorPos, p);
-                    g_cursorPos += wcslen(p);
+                    g_text.insert(g_cursorPos, ins);
+                    g_cursorPos += ins.length();
                     g_selStart = g_selEnd = g_cursorPos;
                     ActiveTab().dirty = true;
                     GlobalUnlock(hData);
@@ -2190,9 +2261,11 @@ static void HandleKey(WPARAM wParam) {
         if (g_selStart != g_selEnd) {
             size_t a = (std::min)(g_selStart, g_selEnd);
             size_t b = (std::max)(g_selStart, g_selEnd);
+            PushUndo(a, g_text.substr(a, b - a), L"");
             g_text.erase(a, b - a);
             g_cursorPos = a;
         } else if (g_cursorPos > 0) {
+            PushUndo(g_cursorPos - 1, g_text.substr(g_cursorPos - 1, 1), L"");
             g_text.erase(g_cursorPos - 1, 1);
             g_cursorPos--;
         }
@@ -2208,9 +2281,11 @@ static void HandleKey(WPARAM wParam) {
         if (g_selStart != g_selEnd) {
             size_t a = (std::min)(g_selStart, g_selEnd);
             size_t b = (std::max)(g_selStart, g_selEnd);
+            PushUndo(a, g_text.substr(a, b - a), L"");
             g_text.erase(a, b - a);
             g_cursorPos = a;
         } else if (g_cursorPos < g_text.length()) {
+            PushUndo(g_cursorPos, g_text.substr(g_cursorPos, 1), L"");
             g_text.erase(g_cursorPos, 1);
         }
         g_selStart = g_selEnd = g_cursorPos;
@@ -2225,8 +2300,11 @@ static void HandleKey(WPARAM wParam) {
         if (g_selStart != g_selEnd) {
             size_t a = (std::min)(g_selStart, g_selEnd);
             size_t b = (std::max)(g_selStart, g_selEnd);
+            PushUndo(a, g_text.substr(a, b - a), L"\n");
             g_text.erase(a, b - a);
             g_cursorPos = a;
+        } else {
+            PushUndo(g_cursorPos, L"", L"\n");
         }
         g_text.insert(g_cursorPos, 1, L'\n');
         g_cursorPos++;
