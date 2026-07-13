@@ -21,6 +21,8 @@ public:
     ID2D1DeviceContext* GetD2DContext() const { return m_d2dContext.Get(); }
     ID2D1Factory1* GetD2DFactory() const { return m_d2dFactory.Get(); }
     IDWriteFactory* GetDWriteFactory() const { return m_dwriteFactory.Get(); }
+    UINT GetSwapWidth() const { return m_swapWidth; }
+    UINT GetSwapHeight() const { return m_swapHeight; }
 
     bool UpdateFrameStatistics();
     UINT64 GetLastFrameId() const { return m_lastFrameId; }
@@ -28,7 +30,8 @@ public:
 
 private:
     bool CreateDevice(IDXGIDevice* dxgiDevice);
-    bool CreateVisualTree();
+    bool CreateVisualTree(HWND hwnd);
+    HWND m_hwnd = nullptr;
 
     ComPtr<ID3D11Device> m_d3dDevice;
     ComPtr<IDCompositionDevice> m_device1;

@@ -76,7 +76,8 @@ bool DCompHelper::Initialize(HWND hwnd) {
     DBG_LOG("DWriteCreateFactory: 0x%08X", hr);
     if (FAILED(hr)) return false;
 
-    return CreateVisualTree();
+    m_hwnd = hwnd;
+    return CreateVisualTree(hwnd);
 }
 
 bool DCompHelper::CreateDevice(IDXGIDevice* dxgiDevice) {
@@ -91,7 +92,14 @@ bool DCompHelper::CreateDevice(IDXGIDevice* dxgiDevice) {
     return SUCCEEDED(hr);
 }
 
-bool DCompHelper::CreateVisualTree() {
+bool DCompHelper::CreateVisualTree(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    m_swapWidth = rc.right - rc.left;
+    m_swapHeight = rc.bottom - rc.top;
+    if (m_swapWidth < 1) m_swapWidth = 800;
+    if (m_swapHeight < 1) m_swapHeight = 600;
+
     HRESULT hr = m_device2->CreateVisual(m_rootVisual.GetAddressOf());
     DBG_LOG("Root visual: 0x%08X", hr);
     if (FAILED(hr)) return false;
@@ -99,9 +107,6 @@ bool DCompHelper::CreateVisualTree() {
     hr = m_device2->CreateVisual(m_editorVisual.GetAddressOf());
     DBG_LOG("Editor visual: 0x%08X", hr);
     if (FAILED(hr)) return false;
-
-    m_swapWidth = 800;
-    m_swapHeight = 600;
 
     DXGI_SWAP_CHAIN_DESC1 scd = {};
     scd.Width = m_swapWidth;

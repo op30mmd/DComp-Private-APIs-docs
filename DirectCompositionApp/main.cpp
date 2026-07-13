@@ -50,6 +50,7 @@ static bool g_dragging = false;
 static bool g_mouseTracking = false;
 static float g_caretAnimX = -1.0f, g_caretAnimY = -1.0f;
 static float g_menuOpacity = 0.0f;
+static float g_tabSwitchAlpha = 1.0f;
 static bool g_animating = false;
 static int g_windowW = 800;
 static int g_windowH = 600;
@@ -217,6 +218,7 @@ static void LoadTabState() {
 
     g_caretAnimX = -1.0f;
     g_caretAnimY = -1.0f;
+    g_tabSwitchAlpha = 0.0f;
 
     if (g_dmanip) {
         float totalH = GetTotalDocumentHeight();
@@ -368,11 +370,14 @@ static int g_menuOpen = -1;
 static int g_menuHover = -1;
 static int g_dropHover = -1;
 static bool g_menuTracking = false;
+static bool g_menuClosing = false;
 
 static bool g_ctxOpen = false;
+static bool g_ctxClosing = false;
 static int g_ctxHover = -1;
 static float g_ctxX = 0;
 static float g_ctxY = 0;
+static float g_ctxOpacity = 0.0f;
 
 static float g_menuBarHoverAlpha = 0.0f;
 static int   g_menuBarHoverIdx   = -1;
@@ -382,6 +387,10 @@ static float g_ctxHoverAlpha = 0.0f;
 static int   g_ctxHoverIdx   = -1;
 static float g_tabHoverAlpha = 0.0f;
 static int   g_tabHoverIdx   = -1;
+static float g_tabCloseAlpha = 0.0f;
+static int   g_tabCloseIdx   = -1;
+static float g_tabNewAlpha = 0.0f;
+static int   g_tabNewIdx   = -1;
 
 static float g_menuSwitchFromX = 0.0f;
 static float g_menuSwitchFromW = 0.0f;
@@ -434,18 +443,24 @@ static void UpdateAnimations() {
         }
     }
 
-    // Menu fade animation
-    if (g_menuOpen >= 0) {
+    // Menu fade animation (open and close)
+    if (g_menuClosing) {
+        g_menuOpacity -= 0.12f;
+        if (g_menuOpacity <= 0.0f) {
+            g_menuOpacity = 0.0f;
+            g_menuOpen = -1;
+            g_menuClosing = false;
+        }
+        stillAnimating = true;
+    } else if (g_menuOpen >= 0) {
         if (g_menuOpacity < 1.0f) {
             g_menuOpacity += 0.12f;
             if (g_menuOpacity > 1.0f) g_menuOpacity = 1.0f;
             stillAnimating = true;
         }
-    } else {
-        g_menuOpacity = 0.0f;
     }
 
-    // Dialog fade+scale animation
+    // Dialog fade+scale animation (open and close)
     if (g_dialogAnimating) {
         if (g_dialogOpacity < 1.0f) {
             g_dialogOpacity += 0.08f;
@@ -457,6 +472,30 @@ static void UpdateAnimations() {
             if (1.0f - g_dialogScale < 0.005f) g_dialogScale = 1.0f;
             stillAnimating = true;
         }
+    } else if (g_dialogOpen != DIALOG_NONE && g_dialogOpacity > 0.0f) {
+        g_dialogOpacity -= 0.06f;
+        g_dialogScale -= (g_dialogScale - 0.92f) * 0.25f;
+        if (g_dialogOpacity < 0.0f) g_dialogOpacity = 0.0f;
+        if (g_dialogScale < 0.92f) g_dialogScale = 0.92f;
+        stillAnimating = true;
+        if (g_dialogOpacity <= 0.0f) {
+            g_dialogOpen = DIALOG_NONE;
+        }
+    }
+
+    // Context menu fade animation (open and close)
+    if (g_ctxClosing) {
+        g_ctxOpacity -= 0.15f;
+        if (g_ctxOpacity <= 0.0f) {
+            g_ctxOpacity = 0.0f;
+            g_ctxOpen = false;
+            g_ctxClosing = false;
+        }
+        stillAnimating = true;
+    } else if (g_ctxOpen && g_ctxOpacity < 1.0f) {
+        g_ctxOpacity += 0.15f;
+        if (g_ctxOpacity > 1.0f) g_ctxOpacity = 1.0f;
+        stillAnimating = true;
     }
 
     // Menu switch slide animation
@@ -493,6 +532,25 @@ static void UpdateAnimations() {
         else stillAnimating = true;
     }
 
+    // Tab close button hover animation
+    {
+        float target = (g_tabCloseHover >= 0) ? 1.0f : 0.0f;
+        if (g_tabCloseHover != g_tabCloseIdx) { g_tabCloseAlpha = 0.0f; g_tabCloseIdx = g_tabCloseHover; }
+        g_tabCloseAlpha += (target - g_tabCloseAlpha) * 0.25f;
+        if (fabsf(g_tabCloseAlpha - target) < 0.01f) g_tabCloseAlpha = target;
+        else stillAnimating = true;
+    }
+
+    // Tab new button hover animation
+    {
+        float target = g_tabNewHover ? 1.0f : 0.0f;
+        int targetIdx = g_tabNewHover ? 1 : -1;
+        if (targetIdx != g_tabNewIdx) { g_tabNewAlpha = 0.0f; g_tabNewIdx = targetIdx; }
+        g_tabNewAlpha += (target - g_tabNewAlpha) * 0.25f;
+        if (fabsf(g_tabNewAlpha - target) < 0.01f) g_tabNewAlpha = target;
+        else stillAnimating = true;
+    }
+
     // Dropdown hover animation
     {
         float target = (g_dropHover >= 0) ? 1.0f : 0.0f;
@@ -509,6 +567,13 @@ static void UpdateAnimations() {
         g_ctxHoverAlpha += (target - g_ctxHoverAlpha) * 0.25f;
         if (fabsf(g_ctxHoverAlpha - target) < 0.01f) g_ctxHoverAlpha = target;
         else stillAnimating = true;
+    }
+
+    // Tab switch content crossfade
+    if (g_tabSwitchAlpha < 1.0f) {
+        g_tabSwitchAlpha += 0.15f;
+        if (g_tabSwitchAlpha > 1.0f) g_tabSwitchAlpha = 1.0f;
+        stillAnimating = true;
     }
 
     if (stillAnimating != g_animating) {
@@ -666,7 +731,6 @@ static void ShowSavePromptDialog(int tabIdx, std::function<void(int)> callback) 
 }
 
 static void CloseDialog(int result) {
-    g_dialogOpen = DIALOG_NONE;
     g_dialogResult = result;
     g_dialogAnimating = false;
     if (g_dialogCallback) {
@@ -707,19 +771,21 @@ static void RenderDialog(ID2D1DeviceContext* ctx) {
     float alpha = g_dialogOpacity;
     float dw = 420.0f;
     float dh = (g_dialogOpen == DIALOG_ABOUT) ? 220.0f : 180.0f;
-    float cx = (float)g_windowW / 2.0f;
-    float cy = (float)g_windowH / 2.0f;
+    float sw = (float)g_dcomp->GetSwapWidth();
+    float sh = (float)g_dcomp->GetSwapHeight();
+    float cx = sw / 2.0f;
+    float cy = sh / 2.0f;
     float dx = cx - dw / 2.0f;
     float dy = cy - dh / 2.0f;
 
-    ctx->PushAxisAlignedClip(D2D1::RectF(0, 0, (float)g_windowW, (float)g_windowH), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    ctx->PushAxisAlignedClip(D2D1::RectF(0, 0, sw, sh), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     D2D1_MATRIX_3X2_F oldTransform;
     ctx->GetTransform(&oldTransform);
 
     ComPtr<ID2D1SolidColorBrush> backdropBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.5f * alpha), backdropBrush.GetAddressOf());
-    ctx->FillRectangle(D2D1::RectF(0, 0, (float)g_windowW, (float)g_windowH), backdropBrush.Get());
+    ctx->FillRectangle(D2D1::RectF(0, 0, sw, sh), backdropBrush.Get());
 
     D2D1_MATRIX_3X2_F scale = D2D1::Matrix3x2F::Scale(g_dialogScale, g_dialogScale, D2D1::Point2F(cx, cy));
     ctx->SetTransform(scale);
@@ -864,10 +930,9 @@ static int HitTestDropdown(float mx, float my) {
 }
 
 static void CloseMenu() {
-    g_menuOpen = -1;
+    g_menuClosing = true;
     g_dropHover = -1;
     g_menuTracking = false;
-    g_menuOpacity = 0.0f;
 }
 
 struct CtxMenuItem { const wchar_t* label; int action; bool separator; };
@@ -881,7 +946,7 @@ static CtxMenuItem g_ctxItems[] = {
 static const int g_ctxItemCount = 5;
 
 static void CloseCtxMenu() {
-    g_ctxOpen = false;
+    g_ctxClosing = true;
     g_ctxHover = -1;
 }
 
@@ -1376,7 +1441,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (wParam == 27) {
-            if (g_ctxOpen) {
+            if (g_ctxOpen || g_ctxClosing) {
                 CloseCtxMenu();
                 Invalidate();
             }
@@ -1490,7 +1555,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        if (g_ctxOpen) {
+        if (g_ctxOpen || g_ctxClosing) {
             int item = HitTestCtxMenu(mx, my);
             if (item >= 0) {
                 ExecMenuAction(g_ctxItems[item].action);
@@ -1500,12 +1565,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        if (g_menuOpen >= 0) {
+        if (g_menuOpen >= 0 && !g_menuClosing) {
             int menu = HitTestMenuBar(mx, my);
             if (menu >= 0) {
                 if (menu == g_menuOpen) {
                     CloseMenu();
                 } else {
+                    g_menuClosing = false;
                     g_menuOpen = menu;
                     g_dropHover = -1;
                     g_menuTracking = true;
@@ -1529,6 +1595,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         int menu = HitTestMenuBar(mx, my);
         if (menu >= 0) {
             CloseCtxMenu();
+            g_menuClosing = false;
             g_menuOpen = menu;
             g_dropHover = -1;
             g_menuTracking = true;
@@ -1603,7 +1670,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         int menu = HitTestMenuBar(mx, my);
         if (menu >= 0) return 0;
 
-        if (g_ctxOpen) {
+        if (g_ctxOpen || g_ctxClosing) {
             int item = HitTestCtxMenu(mx, my);
             if (item >= 0) {
                 ExecMenuAction(g_ctxItems[item].action);
@@ -1642,6 +1709,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             g_ctxX = cx;
             g_ctxY = cy;
             g_ctxOpen = true;
+            g_ctxClosing = false;
+            g_ctxOpacity = 0.0f;
             g_ctxHover = -1;
             Invalidate();
         }
@@ -1667,7 +1736,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
-        if (g_ctxOpen) {
+        if (g_ctxOpen || g_ctxClosing) {
             int item = HitTestCtxMenu(mx, my);
             if (item != g_ctxHover) {
                 g_ctxHover = item;
@@ -1691,6 +1760,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     g_menuSwitchToX = g_menus[menu].x;
                     g_menuSwitchToW = g_menus[menu].w;
                     g_menuSwitchProgress = 0.0f;
+                    g_menuClosing = false;
                     g_menuOpen = menu;
                     g_dropHover = -1;
                 }
@@ -1784,7 +1854,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_MOUSEWHEEL: {
-        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float visibleH = (float)g_windowH - g_marginTop - 30.0f;
         float totalH = GetTotalDocumentHeight();
         float currentScroll = g_dmanip ? g_dmanip->GetScrollY() : g_scrollY;
@@ -1799,7 +1869,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_KILLFOCUS:
-        if (g_menuOpen >= 0) {
+        if (g_menuOpen >= 0 && !g_menuClosing) {
             CloseMenu();
             Invalidate();
         }
@@ -1831,11 +1901,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             cursorId = overBtn ? IDC_HAND : IDC_ARROW;
         } else if (g_tabDragging) {
             cursorId = IDC_ARROW;
-        } else if (g_menuOpen >= 0) {
+        } else if (g_menuOpen >= 0 || g_menuClosing) {
             bool overDropdown = (HitTestDropdown((float)pt.x, (float)pt.y) >= 0);
             bool overMenuBar = (pt.y >= 0 && pt.y < g_menuBarH);
             cursorId = (overDropdown || overMenuBar) ? IDC_HAND : IDC_ARROW;
-        } else if (g_ctxOpen) {
+        } else if (g_ctxOpen || g_ctxClosing) {
             int item = HitTestCtxMenu((float)pt.x, (float)pt.y);
             cursorId = item >= 0 ? IDC_HAND : IDC_ARROW;
         } else {
@@ -2031,10 +2101,10 @@ static void UpdateCursorCache() {
 
 static void HandleKey(WPARAM wParam) {
     if (wParam == VK_ESCAPE) {
-        if (g_menuOpen >= 0) {
+        if (g_menuOpen >= 0 && !g_menuClosing) {
             CloseMenu();
             Invalidate();
-        } else if (g_ctxOpen) {
+        } else if (g_ctxOpen || g_ctxClosing) {
             CloseCtxMenu();
             Invalidate();
         }
@@ -2511,6 +2581,10 @@ static void EnsureCursorVisible() {
 static void RenderEditor() {
     if (!g_dcomp || !g_dcomp->GetSwapChain()) return;
 
+    float swapW = (float)g_dcomp->GetSwapWidth();
+    float swapH = (float)g_dcomp->GetSwapHeight();
+    if (swapW < 1 || swapH < 1) return;
+
     ComPtr<IDXGISurface> backBuffer;
     HRESULT hr = g_dcomp->GetSwapChain()->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()));
     if (FAILED(hr)) return;
@@ -2537,7 +2611,7 @@ static void RenderEditor() {
 
     if (g_textLayout) {
         float footerH = g_showStatusBar ? 30.0f : 0.0f;
-        D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, (float)g_windowW, (float)g_windowH - footerH);
+        D2D1_RECT_F editorClip = D2D1::RectF(0, g_menuBarH + g_tabBarH, swapW, swapH - footerH);
         ctx->PushAxisAlignedClip(editorClip, D2D1_ANTIALIAS_MODE_ALIASED);
 
         ComPtr<ID2D1SolidColorBrush> textBrush;
@@ -2548,6 +2622,11 @@ static void RenderEditor() {
 
         ComPtr<ID2D1SolidColorBrush> caretBrush;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.40f, 0.70f, 1.0f), caretBrush.GetAddressOf());
+
+        if (g_tabSwitchAlpha < 1.0f) {
+            textBrush->SetOpacity(g_tabSwitchAlpha);
+            selBrush->SetOpacity(0.4f * g_tabSwitchAlpha);
+        }
 
         if (g_selStart != g_selEnd) {
             size_t a = (std::min)(g_selStart, g_selEnd);
@@ -2589,6 +2668,9 @@ static void RenderEditor() {
 
         ComPtr<ID2D1SolidColorBrush> lineNoBrush;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.35f, 0.35f, 0.38f), lineNoBrush.GetAddressOf());
+        if (g_tabSwitchAlpha < 1.0f) {
+            lineNoBrush->SetOpacity(g_tabSwitchAlpha);
+        }
 
         UINT32 lineCount = 0;
         g_textLayout->GetLineMetrics(nullptr, 0, &lineCount);
@@ -2612,7 +2694,7 @@ static void RenderEditor() {
                 float lh = metrics[i].height;
 
                 // Stop drawing immediately if the line goes below the viewport
-                if (ly > (float)g_windowH) {
+                if (ly > swapH) {
                     break;
                 }
 
@@ -2644,7 +2726,7 @@ static void RenderEditor() {
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.28f), separatorBrush.GetAddressOf());
 
     float menuY = 0;
-    ctx->FillRectangle(D2D1::RectF(0, menuY, (float)g_windowW, menuY + g_menuBarH), chromeBgBrush.Get());
+    ctx->FillRectangle(D2D1::RectF(0, menuY, swapW, menuY + g_menuBarH), chromeBgBrush.Get());
 
     ComPtr<ID2D1SolidColorBrush> menuText;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.80f, 0.82f), menuText.GetAddressOf());
@@ -2681,11 +2763,11 @@ static void RenderEditor() {
         }
     }
 
-    ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F((float)g_windowW, menuY + g_menuBarH),
+    ctx->DrawLine(D2D1::Point2F(0, menuY + g_menuBarH), D2D1::Point2F(swapW, menuY + g_menuBarH),
         separatorBrush.Get(), 1.0f);
 
     float tabBarY = menuY + g_menuBarH;
-    ctx->FillRectangle(D2D1::RectF(0, tabBarY, (float)g_windowW, tabBarY + g_tabBarH), chromeBgBrush.Get());
+    ctx->FillRectangle(D2D1::RectF(0, tabBarY, swapW, tabBarY + g_tabBarH), chromeBgBrush.Get());
 
     ComPtr<ID2D1SolidColorBrush> tabActiveBgBrush;
     ctx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.12f), tabActiveBgBrush.GetAddressOf());
@@ -2731,10 +2813,11 @@ static void RenderEditor() {
         if (g_tabs.size() > 1) {
             float closeX = tabX + w - 18.0f;
             float closeY = tabBarY + (g_tabBarH - g_tabCloseSize) / 2.0f;
-            bool closeHov = (i == g_tabCloseHover);
-            float closeAlpha = closeHov ? 0.8f + 0.2f * g_tabHoverAlpha : 0.52f;
+            float closeHovFade = (i == g_tabCloseHover) ? g_tabCloseAlpha : 0.0f;
+            float closeAlpha = 0.52f + closeHovFade * 0.28f;
+            closeAlpha += (hover ? g_tabHoverAlpha * 0.2f : 0.0f);
             tabCloseBrush->SetOpacity(closeAlpha);
-            auto* closeBrushPtr = closeHov ? tabCloseHoverBrush.Get() : tabCloseBrush.Get();
+            auto* closeBrushPtr = (closeHovFade > 0.01f) ? tabCloseHoverBrush.Get() : tabCloseBrush.Get();
             ctx->DrawLine(D2D1::Point2F(closeX, closeY), D2D1::Point2F(closeX + g_tabCloseSize, closeY + g_tabCloseSize),
                 closeBrushPtr, 1.2f);
             ctx->DrawLine(D2D1::Point2F(closeX + g_tabCloseSize, closeY), D2D1::Point2F(closeX, closeY + g_tabCloseSize),
@@ -2746,11 +2829,14 @@ static void RenderEditor() {
 
     {
         float btnW = g_tabBarH;
-        if (g_tabNewHover) {
+        if (g_tabNewAlpha > 0.01f) {
+            tabHoverBgBrush->SetOpacity(g_tabNewAlpha);
             ctx->FillRectangle(D2D1::RectF(tabX, tabBarY, tabX + btnW, tabBarY + g_tabBarH), tabHoverBgBrush.Get());
+            tabHoverBgBrush->SetOpacity(1.0f);
         }
+        float newAlpha = 0.50f + g_tabNewAlpha * 0.40f;
         ComPtr<ID2D1SolidColorBrush> newBtnBrush;
-        ctx->CreateSolidColorBrush(g_tabNewHover ? D2D1::ColorF(0.90f, 0.90f, 0.92f) : D2D1::ColorF(0.50f, 0.50f, 0.52f), newBtnBrush.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(newAlpha, newAlpha, newAlpha + 0.02f), newBtnBrush.GetAddressOf());
         float cx = tabX + btnW / 2.0f;
         float cy = tabBarY + g_tabBarH / 2.0f;
         float hs = 5.0f;
@@ -2758,13 +2844,13 @@ static void RenderEditor() {
         ctx->DrawLine(D2D1::Point2F(cx, cy - hs), D2D1::Point2F(cx, cy + hs), newBtnBrush.Get(), 1.5f);
     }
 
-    ctx->DrawLine(D2D1::Point2F(0, tabBarY + g_tabBarH), D2D1::Point2F((float)g_windowW, tabBarY + g_tabBarH),
+    ctx->DrawLine(D2D1::Point2F(0, tabBarY + g_tabBarH), D2D1::Point2F(swapW, tabBarY + g_tabBarH),
         separatorBrush.Get(), 1.0f);
 
     float footerH = g_showStatusBar ? 30.0f : 0.0f;
     if (g_showStatusBar) {
-        ctx->FillRectangle(D2D1::RectF(0, (float)g_windowH - footerH, (float)g_windowW, (float)g_windowH), chromeBgBrush.Get());
-        ctx->DrawLine(D2D1::Point2F(0, (float)g_windowH - footerH), D2D1::Point2F((float)g_windowW, (float)g_windowH - footerH),
+        ctx->FillRectangle(D2D1::RectF(0, swapH - footerH, swapW, swapH), chromeBgBrush.Get());
+        ctx->DrawLine(D2D1::Point2F(0, swapH - footerH), D2D1::Point2F(swapW, swapH - footerH),
             separatorBrush.Get(), 1.0f);
     }
 
@@ -2779,7 +2865,7 @@ static void RenderEditor() {
         ComPtr<ID2D1SolidColorBrush> footerStatusBrush;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.50f, 0.50f, 0.54f), footerStatusBrush.GetAddressOf());
         ctx->DrawText(statusBuf, (UINT32)wcslen(statusBuf), g_statusFmt.Get(),
-            D2D1::RectF(12, (float)g_windowH - footerH, (float)g_windowW * 0.5f, (float)g_windowH),
+            D2D1::RectF(12, swapH - footerH, swapW * 0.5f, swapH),
             footerStatusBrush.Get());
 
         ComPtr<ID2D1SolidColorBrush> hintBrush;
@@ -2787,12 +2873,20 @@ static void RenderEditor() {
         if (g_hintFmt) {
             const wchar_t* hint = L"DirectComposition + D2D + DWrite";
             ctx->DrawText(hint, (UINT32)wcslen(hint), g_hintFmt.Get(),
-                D2D1::RectF((float)g_windowW * 0.5f, (float)g_windowH - footerH, (float)g_windowW - 12, (float)g_windowH),
+                D2D1::RectF(swapW * 0.5f, swapH - footerH, swapW - 12, swapH),
                 hintBrush.Get());
         }
     }
 
-    if (g_menuOpen >= 0) {
+    if (g_menuOpen >= 0 || g_menuClosing) {
+        ctx->Flush();
+        float totalH = 0;
+        MenuDef& m = g_menus[g_menuOpen];
+        for (int i = 0; i < m.count; i++)
+            totalH += m.items[i].separator ? 6.0f : 24.0f;
+
+        float dropY = menuY + g_menuBarH;
+
         ComPtr<ID2D1SolidColorBrush> dropBg;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.16f, 0.18f, g_menuOpacity), dropBg.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> dropHighlight;
@@ -2806,7 +2900,6 @@ static void RenderEditor() {
         ComPtr<ID2D1SolidColorBrush> dropBorder;
         ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f, g_menuOpacity), dropBorder.GetAddressOf());
 
-        MenuDef& m = g_menus[g_menuOpen];
         float dropW = 240.0f;
         float dropX;
         if (g_menuSwitchProgress < 1.0f) {
@@ -2815,11 +2908,6 @@ static void RenderEditor() {
         } else {
             dropX = m.x;
         }
-        float dropY = menuY + g_menuBarH;
-
-        float totalH = 0;
-        for (int i = 0; i < m.count; i++)
-            totalH += m.items[i].separator ? 6.0f : 24.0f;
 
         ctx->FillRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBg.Get());
         ctx->DrawRectangle(D2D1::RectF(dropX, dropY, dropX + dropW, dropY + totalH), dropBorder.Get(), 1.0f);
@@ -2879,19 +2967,20 @@ static void RenderEditor() {
         }
     }
 
-    if (g_ctxOpen) {
+    if (g_ctxOpen || g_ctxClosing) {
+        float ctxOpacity = g_ctxOpacity;
         ComPtr<ID2D1SolidColorBrush> ctxBg;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f), ctxBg.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.18f, 0.18f, 0.20f, ctxOpacity), ctxBg.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> ctxHighlight;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f), ctxHighlight.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.22f, 0.37f, 0.60f, ctxOpacity), ctxHighlight.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> ctxText;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f), ctxText.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.82f, 0.84f, ctxOpacity), ctxText.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> ctxTextDim;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.45f, 0.45f, 0.48f), ctxTextDim.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.45f, 0.45f, 0.48f, ctxOpacity), ctxTextDim.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> ctxSep;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f), ctxSep.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.28f, 0.32f, ctxOpacity), ctxSep.GetAddressOf());
         ComPtr<ID2D1SolidColorBrush> ctxBorder;
-        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f), ctxBorder.GetAddressOf());
+        ctx->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.35f, ctxOpacity), ctxBorder.GetAddressOf());
 
         float dw = 200.0f;
         float totalH = 0;
